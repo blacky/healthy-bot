@@ -193,7 +193,7 @@ mod tests {
     fn test_markov_add_phrase() {
         let mut markov = Markov::default();
         markov.add_phrase("hello world this is a test", 3);
-        
+
         assert!(markov.chain.contains_key("_start"));
         assert!(markov.chain.get("_start").unwrap().contains_key("hello"));
         assert!(markov.chain.contains_key("hello"));
@@ -211,7 +211,7 @@ mod tests {
     fn test_markov_generate() {
         let mut markov = Markov::default();
         markov.add_phrase("the quick brown fox jumps over the lazy dog.", 3);
-        
+
         let generated = markov.generate();
         assert!(generated.is_some());
         let phrase = generated.unwrap();
@@ -228,6 +228,9 @@ mod tests {
 
         assert_eq!(repo.format_content("hello world"), "Hello world.");
         assert_eq!(repo.format_content("<@12345> hello"), "Hello.");
-        assert_eq!(repo.format_content("Already capitalized."), "Already capitalized.");
+        assert_eq!(
+            repo.format_content("Already capitalized."),
+            "Already capitalized."
+        );
     }
 }

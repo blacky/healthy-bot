@@ -178,14 +178,12 @@ pub async fn remind_cmd(
         let mut created = 0;
 
         for r in reminders {
-            sqlx::query(
-                "INSERT INTO reminder (message, date, owner_discord_id) VALUES (?, ?, ?)",
-            )
-            .bind(r.message)
-            .bind(r.datetime_utc.timestamp_millis())
-            .bind(&user_id)
-            .execute(pool)
-            .await?;
+            sqlx::query("INSERT INTO reminder (message, date, owner_discord_id) VALUES (?, ?, ?)")
+                .bind(r.message)
+                .bind(r.datetime_utc.timestamp_millis())
+                .bind(&user_id)
+                .execute(pool)
+                .await?;
             created += 1;
         }
 
