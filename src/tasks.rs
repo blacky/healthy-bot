@@ -122,32 +122,50 @@ async fn update_reminders_vc(
         .take(3)
         .collect();
 
-    log::info!(
-        "Updating VC reminders (found {} for today)",
-        reminders.len()
-    );
-
     let guild = GuildId::new(guild_id);
     let channels = guild.channels(http).await?;
 
-    // Delete existing voice channels in the category
-    for (_, channel) in channels {
+    let mut existing_vcs = Vec::new();
+    for (_, channel) in &channels {
         if let Some(parent) = channel.parent_id {
             if parent.get() == category_id && channel.kind == ChannelType::Voice {
-                log::info!("Deleting old VC reminder: {}", channel.name);
-                let _ = channel.delete(http).await;
+                existing_vcs.push(channel.clone());
             }
         }
     }
+    existing_vcs.sort_by_key(|c| c.position);
+
+    let desired_names: Vec<String> = reminders
+        .iter()
+        .map(|r| {
+            let time_str = r
+                .date_utc()
+                .with_timezone(&Amsterdam)
+                .format("%H:%M")
+                .to_string();
+            format!("{} - {}", time_str, r.message)
+        })
+        .collect();
+
+    let current_names: Vec<String> = existing_vcs.iter().map(|c| c.name.clone()).collect();
+
+    if desired_names == current_names {
+        return Ok(());
+    }
+
+    log::info!(
+        "Updating VC reminders (found {} for today, changes detected)",
+        reminders.len()
+    );
+
+    // Delete existing voice channels in the category
+    for channel in existing_vcs {
+        log::info!("Deleting old VC reminder: {}", channel.name);
+        let _ = channel.delete(http).await;
+    }
 
     // Create new ones
-    for reminder in reminders {
-        let time_str = reminder
-            .date_utc()
-            .with_timezone(&Amsterdam)
-            .format("%H:%M")
-            .to_string();
-        let name = format!("{} - {}", time_str, reminder.message);
+    for name in desired_names {
         log::info!("Creating new VC reminder: {}", name);
         let _ = guild
             .create_channel(
