@@ -1,13 +1,13 @@
+mod commands;
 mod db;
 mod markov;
 mod openai;
 mod tasks;
-mod commands;
 
+use crate::markov::MarkovRepository;
+use crate::openai::{ChatMessage, OpenAIClient};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::SqlitePool;
-use crate::markov::MarkovRepository;
-use crate::openai::{OpenAIClient, ChatMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -33,31 +33,39 @@ async fn event_handler(
 ) -> Result<(), Error> {
     match event {
         serenity::FullEvent::Message { new_message } => {
-            if new_message.author.bot { return Ok(()); }
+            if new_message.author.bot {
+                return Ok(());
+            }
 
             let author_id_str = new_message.author.id.to_string();
             let bot_id_str = ctx.cache.current_user().id.to_string();
 
             // Update last message time
             let _ = db::create_user_if_not_exists(&data.db_pool, &author_id_str).await;
-            let _ = db::update_last_message(&data.db_pool, &author_id_str, chrono::Utc::now()).await;
+            let _ =
+                db::update_last_message(&data.db_pool, &author_id_str, chrono::Utc::now()).await;
 
             // Store Markov
-            data.markov_repo.store(
-                &author_id_str,
-                &bot_id_str,
-                &new_message.content
-            ).await;
+            data.markov_repo
+                .store(&author_id_str, &bot_id_str, &new_message.content)
+                .await;
 
             // OpenAI Reply Logic (AiListener.kt)
             let self_id = ctx.cache.current_user().id;
             let mentioned = new_message.mentions.iter().any(|u| u.id == self_id);
-            let replied = new_message.referenced_message.as_ref().map(|m| m.author.id == self_id).unwrap_or(false);
+            let replied = new_message
+                .referenced_message
+                .as_ref()
+                .map(|m| m.author.id == self_id)
+                .unwrap_or(false);
 
             if mentioned || replied {
                 let cooldown_secs: u64 = {
                     let cache = data.settings_cache.read().await;
-                    cache.get("ai_cooldown_seconds").and_then(|v| v.parse().ok()).unwrap_or(0)
+                    cache
+                        .get("ai_cooldown_seconds")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0)
                 };
 
                 let mut last_inv = data.last_openai.lock().await;
@@ -67,13 +75,24 @@ async fn event_handler(
                 *last_inv = std::time::Instant::now();
                 drop(last_inv);
 
-                log::info!("OpenAI trigger from {} in channel {}: {}", new_message.author.name, new_message.channel_id, new_message.content.trim());
-                
+                log::info!(
+                    "OpenAI trigger from {} in channel {}: {}",
+                    new_message.author.name,
+                    new_message.channel_id,
+                    new_message.content.trim()
+                );
+
                 let (bot_context, chat_model) = {
                     let cache = data.settings_cache.read().await;
                     (
-                        cache.get("ai_initial_prompt").cloned().unwrap_or_else(|| "You are a helpful assistant.".to_string()),
-                        cache.get("ai_chat_model").cloned().unwrap_or_else(|| "gpt-3.5-turbo".to_string())
+                        cache
+                            .get("ai_initial_prompt")
+                            .cloned()
+                            .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+                        cache
+                            .get("ai_chat_model")
+                            .cloned()
+                            .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
                     )
                 };
 
@@ -81,11 +100,15 @@ async fn event_handler(
                 let mut messages = Vec::new();
                 let mut current_msg = new_message.clone();
                 let bot_id = ctx.cache.current_user().id;
-                
+
                 // Traverse up the reply chain (limit to 10 for safety/tokens)
                 for _ in 0..10 {
                     if let Some(ref_msg) = &current_msg.referenced_message {
-                        let role = if ref_msg.author.id == bot_id { "assistant" } else { "user" };
+                        let role = if ref_msg.author.id == bot_id {
+                            "assistant"
+                        } else {
+                            "user"
+                        };
                         messages.push(ChatMessage {
                             role: role.to_string(),
                             name: Some(ref_msg.author.name.clone()),
@@ -99,14 +122,19 @@ async fn event_handler(
                 messages.reverse(); // Reverse the history to be in chronological order
 
                 // Add the developer prompt at the very beginning
-                messages.insert(0, ChatMessage { 
-                    role: "developer".to_string(), 
-                    name: Some(bot_name), 
-                    content: bot_context 
-                });
+                messages.insert(
+                    0,
+                    ChatMessage {
+                        role: "developer".to_string(),
+                        name: Some(bot_name),
+                        content: bot_context,
+                    },
+                );
 
                 let prompt = new_message.content.trim();
-                if prompt.is_empty() { return Ok(()); }
+                if prompt.is_empty() {
+                    return Ok(());
+                }
 
                 messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -114,7 +142,9 @@ async fn event_handler(
                     content: prompt.to_string(),
                 });
 
-                let _ = new_message.react(ctx, serenity::all::ReactionType::Unicode("💭".to_string())).await;
+                let _ = new_message
+                    .react(ctx, serenity::all::ReactionType::Unicode("💭".to_string()))
+                    .await;
                 let _typing = new_message.channel_id.start_typing(&ctx.http);
 
                 match data.openai_client.create_chat(&chat_model, messages).await {
@@ -130,7 +160,10 @@ async fn event_handler(
                             if content.len() <= 2000 {
                                 let _ = new_message.reply(ctx, content).await;
                             } else {
-                                log::info!("OpenAI response too long ({} chars), splitting...", content.len());
+                                log::info!(
+                                    "OpenAI response too long ({} chars), splitting...",
+                                    content.len()
+                                );
                                 let mut start = 0;
                                 while start < content.len() {
                                     let end = std::cmp::min(start + 2000, content.len());
@@ -144,7 +177,9 @@ async fn event_handler(
                     }
                     Err(e) => {
                         log::error!("OpenAI API error: {:?}", e);
-                        let _ = new_message.reply(ctx, "An error occurred while communicating with OpenAI").await;
+                        let _ = new_message
+                            .reply(ctx, "An error occurred while communicating with OpenAI")
+                            .await;
                     }
                 }
             }
@@ -157,15 +192,18 @@ async fn event_handler(
 #[tokio::main]
 async fn main() {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "none,healthy_bot=info,poise=warn,serenity=warn,sqlx=warn");
+        std::env::set_var(
+            "RUST_LOG",
+            "none,healthy_bot=info,poise=warn,serenity=warn,sqlx=warn",
+        );
     }
 
     let mut builder = env_logger::Builder::from_default_env();
     builder.format(|buf, record| {
-        use std::io::Write;
         use chrono_tz::Europe::Amsterdam;
+        use std::io::Write;
         let now = chrono::Utc::now().with_timezone(&Amsterdam);
-        
+
         let level_color = match record.level() {
             log::Level::Error => "\x1b[31m",
             log::Level::Warn => "\x1b[33m",
@@ -173,14 +211,17 @@ async fn main() {
             _ => "\x1b[34m",
         };
         let reset = "\x1b[0m";
-        
-        writeln!(buf, "[{} {}{:5}{}] {:<20} | {}", 
+
+        writeln!(
+            buf,
+            "[{} {}{:5}{}] {:<20} | {}",
             now.format("%Y-%m-%d %H:%M:%S"),
             level_color,
             record.level(),
             reset,
             record.target(),
-            record.args())
+            record.args()
+        )
     });
     builder.init();
 
@@ -191,8 +232,10 @@ async fn main() {
     let openai_key = std::env::var("OPENAI_SECRET").expect("missing OPENAI_SECRET");
 
     log::info!("Connecting to database: {}", db_url);
-    let pool = SqlitePool::connect(&format!("sqlite:{}", db_url)).await.expect("Failed to connect to database");
-    
+    let pool = SqlitePool::connect(&format!("sqlite:{}", db_url))
+        .await
+        .expect("Failed to connect to database");
+
     // Load initial settings cache
     let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT k, v FROM setting")
         .fetch_all(&pool)
@@ -206,15 +249,19 @@ async fn main() {
 
     log::info!("Loading Markov repository...");
     let markov_repo = MarkovRepository::new("/healthybot/data/markovs");
-    
+
     let openai_client = OpenAIClient::new(openai_key);
 
     let data = Data {
         db_pool: pool.clone(),
         markov_repo,
         openai_client,
-        last_markov: tokio::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(3600)),
-        last_openai: tokio::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(3600)),
+        last_markov: tokio::sync::Mutex::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        ),
+        last_openai: tokio::sync::Mutex::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        ),
         settings_cache: settings_cache.clone(),
     };
 
@@ -243,12 +290,21 @@ async fn main() {
                         poise::Context::Prefix(p) => p.args.trim().to_string(),
                         poise::Context::Application(_) => "[Slash Command]".to_string(),
                     };
-                    log::info!("INVOKE | user: {} | cmd: {} | args: {}", ctx.author().name, ctx.command().name, if args.is_empty() { "-" } else { &args });
+                    log::info!(
+                        "INVOKE | user: {} | cmd: {} | args: {}",
+                        ctx.author().name,
+                        ctx.command().name,
+                        if args.is_empty() { "-" } else { &args }
+                    );
                 })
             },
             post_command: |ctx| {
                 Box::pin(async move {
-                    log::info!("DONE   | user: {} | cmd: {}", ctx.author().name, ctx.command().name);
+                    log::info!(
+                        "DONE   | user: {} | cmd: {}",
+                        ctx.author().name,
+                        ctx.command().name
+                    );
                 })
             },
             on_error: |error| {
@@ -256,7 +312,12 @@ async fn main() {
                     match error {
                         poise::FrameworkError::UnknownCommand { .. } => (),
                         poise::FrameworkError::Command { error, ctx, .. } => {
-                            log::error!("Command error | user: {} | cmd: {} | error: {}", ctx.author().name, ctx.command().name, error);
+                            log::error!(
+                                "Command error | user: {} | cmd: {} | error: {}",
+                                ctx.author().name,
+                                ctx.command().name,
+                                error
+                            );
                             let embed = serenity::builder::CreateEmbed::new()
                                 .title("Error")
                                 .description(error.to_string())
@@ -281,7 +342,10 @@ async fn main() {
                 dynamic_prefix: Some(|ctx| {
                     Box::pin(async move {
                         let cache = ctx.data.settings_cache.read().await;
-                        Ok(cache.get("command_prefix").cloned().or(Some("!".to_string())))
+                        Ok(cache
+                            .get("command_prefix")
+                            .cloned()
+                            .or(Some("!".to_string())))
                     })
                 }),
                 ..Default::default()
@@ -291,7 +355,7 @@ async fn main() {
         .setup(|ctx, ready, _framework| {
             Box::pin(async move {
                 log::info!("Bot is logged in as {}", ready.user.tag());
-                
+
                 let guild_count = ready.guilds.len();
                 log::info!("Active in {} guilds", guild_count);
 
@@ -304,12 +368,17 @@ async fn main() {
                 // One-time database cleanup for legacy settings
                 let pool = data.db_pool.clone();
                 tokio::spawn(async move {
-                    let res = sqlx::query("DELETE FROM setting WHERE k LIKE 'food_%' OR k = 'bday_announce_channel'")
-                        .execute(&pool)
-                        .await;
+                    let res = sqlx::query(
+                        "DELETE FROM setting WHERE k LIKE 'food_%' OR k = 'bday_announce_channel'",
+                    )
+                    .execute(&pool)
+                    .await;
                     if let Ok(r) = res {
                         if r.rows_affected() > 0 {
-                            log::info!("Cleaned up {} legacy settings from database.", r.rows_affected());
+                            log::info!(
+                                "Cleaned up {} legacy settings from database.",
+                                r.rows_affected()
+                            );
                         }
                     }
                 });
@@ -320,7 +389,10 @@ async fn main() {
                 tokio::spawn(async move {
                     let (status_type, status_msg) = {
                         let cache = settings_cache_clone.read().await;
-                        (cache.get("bot_status_type").cloned(), cache.get("bot_status_message").cloned())
+                        (
+                            cache.get("bot_status_type").cloned(),
+                            cache.get("bot_status_message").cloned(),
+                        )
                     };
 
                     if let (Some(t), Some(m)) = (status_type, status_msg) {

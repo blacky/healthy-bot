@@ -1,6 +1,6 @@
-use sqlx::sqlite::SqlitePool;
-use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqlitePool;
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
@@ -75,7 +75,11 @@ pub async fn create_user_if_not_exists(pool: &SqlitePool, discord_id: &str) -> s
     Ok(())
 }
 
-pub async fn update_last_message(pool: &SqlitePool, discord_id: &str, time: DateTime<Utc>) -> sqlx::Result<()> {
+pub async fn update_last_message(
+    pool: &SqlitePool,
+    discord_id: &str,
+    time: DateTime<Utc>,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE users SET last_message = ? WHERE discord_id = ?")
         .bind(time.timestamp_millis())
         .bind(discord_id)

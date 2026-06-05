@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -63,8 +63,13 @@ impl OpenAIClient {
         }
     }
 
-    pub async fn create_chat(&self, model: &str, messages: Vec<ChatMessage>) -> reqwest::Result<ChatResponse> {
-        self.client.post("https://api.openai.com/v1/chat/completions")
+    pub async fn create_chat(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+    ) -> reqwest::Result<ChatResponse> {
+        self.client
+            .post("https://api.openai.com/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&ChatRequest {
                 model: model.to_string(),
@@ -77,7 +82,8 @@ impl OpenAIClient {
     }
 
     pub async fn create_image(&self, prompt: &str, user: &str) -> reqwest::Result<ImageResponse> {
-        self.client.post("https://api.openai.com/v1/images/generations")
+        self.client
+            .post("https://api.openai.com/v1/images/generations")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&ImageRequest {
                 prompt: prompt.to_string(),

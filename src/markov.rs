@@ -1,11 +1,11 @@
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use rand::Rng;
-use std::fs::File;
-use std::io::{Read, Write};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Markov {
@@ -56,7 +56,8 @@ impl Markov {
             }
         }
 
-        let result = phrase.into_iter()
+        let result = phrase
+            .into_iter()
             .filter(|w| !mention_regex.is_match(w))
             .collect::<Vec<_>>()
             .join(" ");
@@ -70,9 +71,13 @@ impl Markov {
     }
 
     fn pick_random(&self, frequencies: &HashMap<String, i32>) -> Option<String> {
-        if frequencies.is_empty() { return None; }
+        if frequencies.is_empty() {
+            return None;
+        }
         let total: i32 = frequencies.values().sum();
-        if total <= 0 { return None; }
+        if total <= 0 {
+            return None;
+        }
         let mut random = rand::thread_rng().gen_range(1..=total);
         for (word, count) in frequencies {
             random -= count;
@@ -124,17 +129,26 @@ impl MarkovRepository {
                 let _ = encoder.write_all(json.as_bytes());
                 let _ = encoder.finish();
             }
-        }).await;
+        })
+        .await;
     }
 
     pub async fn store(&self, user_id: &str, bot_id: &str, content: &str) {
-        if user_id == bot_id { return; }
+        if user_id == bot_id {
+            return;
+        }
 
         let mut markovs = self.markovs.write().await;
         let formatted = self.format_content(content);
 
-        markovs.entry(user_id.to_string()).or_default().add_phrase(&formatted, 3);
-        markovs.entry(bot_id.to_string()).or_default().add_phrase(&formatted, 3);
+        markovs
+            .entry(user_id.to_string())
+            .or_default()
+            .add_phrase(&formatted, 3);
+        markovs
+            .entry(bot_id.to_string())
+            .or_default()
+            .add_phrase(&formatted, 3);
 
         let mut last_save = self.last_save.lock().await;
         if last_save.elapsed().as_secs() > 15 * 60 {
@@ -155,8 +169,10 @@ impl MarkovRepository {
     fn format_content(&self, content: &str) -> String {
         let re = regex::Regex::new(r"<(@[!&]?|#)\d+>").unwrap();
         let cleaned = re.replace_all(content, "").trim().to_string();
-        if cleaned.is_empty() { return String::new(); }
-        
+        if cleaned.is_empty() {
+            return String::new();
+        }
+
         let mut capitalized = cleaned;
         if let Some(first) = capitalized.get_mut(0..1) {
             first.make_ascii_uppercase();
