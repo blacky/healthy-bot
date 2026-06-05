@@ -1,6 +1,6 @@
 use crate::db;
 use crate::Data;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
 use poise::serenity_prelude as serenity;
 use serenity::builder::{CreateEmbed, CreateEmbedFooter};
@@ -37,7 +37,7 @@ pub async fn remind_cmd(
 
     let input_val = input.unwrap_or_default();
     let parts: Vec<&str> = input_val.split_whitespace().collect();
-    let action = parts.get(0).copied().unwrap_or("");
+    let action = parts.first().copied().unwrap_or("");
 
     if action == "remove" {
         let id_str = parts.get(1).ok_or("No id provided")?;
@@ -144,7 +144,7 @@ pub async fn remind_cmd(
 
     if is_authorized {
         let adds: Vec<&str> = input_val
-            .split(|c| c == ';' || c == '\n')
+            .split([';', '\n'])
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -190,8 +190,6 @@ pub async fn remind_cmd(
 /// Generate a markov chain message for a user
 #[poise::command(slash_command, prefix_command)]
 pub async fn markov(ctx: Context<'_>, user: Option<serenity::User>) -> Result<(), Error> {
-    let pool = &ctx.data().db_pool;
-
     // Check cooldown from cache
     let cooldown_secs: u64 = {
         let cache = ctx.data().settings_cache.read().await;
@@ -404,7 +402,7 @@ pub async fn user_cmd(
             .as_deref()
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(5)
-            .abs() as usize;
+            .unsigned_abs() as usize;
         let users: Vec<db::User> =
             sqlx::query_as::<_, db::User>("SELECT * FROM users ORDER BY last_message ASC LIMIT ?")
                 .bind(top_x as i32)

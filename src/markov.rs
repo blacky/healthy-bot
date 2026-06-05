@@ -155,7 +155,7 @@ impl MarkovRepository {
             let json = serde_json::to_string(&*markovs).unwrap_or_default();
             drop(markovs);
             let path = self.storage_path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 if let Ok(file) = File::create(path) {
                     let mut encoder = GzEncoder::new(file, Compression::default());
                     let _ = encoder.write_all(json.as_bytes());

@@ -23,7 +23,6 @@ pub struct Data {
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, Data, Error>;
 
 async fn event_handler(
     ctx: &serenity::Context,
@@ -31,160 +30,156 @@ async fn event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<(), Error> {
-    match event {
-        serenity::FullEvent::Message { new_message } => {
-            if new_message.author.bot {
+    if let serenity::FullEvent::Message { new_message } = event {
+        if new_message.author.bot {
+            return Ok(());
+        }
+
+        let author_id_str = new_message.author.id.to_string();
+        let bot_id_str = ctx.cache.current_user().id.to_string();
+
+        // Update last message time
+        let _ = db::create_user_if_not_exists(&data.db_pool, &author_id_str).await;
+        let _ = db::update_last_message(&data.db_pool, &author_id_str, chrono::Utc::now()).await;
+
+        // Store Markov
+        data.markov_repo
+            .store(&author_id_str, &bot_id_str, &new_message.content)
+            .await;
+
+        // OpenAI Reply Logic (AiListener.kt)
+        let self_id = ctx.cache.current_user().id;
+        let mentioned = new_message.mentions.iter().any(|u| u.id == self_id);
+        let replied = new_message
+            .referenced_message
+            .as_ref()
+            .map(|m| m.author.id == self_id)
+            .unwrap_or(false);
+
+        if mentioned || replied {
+            let cooldown_secs: u64 = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_cooldown_seconds")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+
+            let mut last_inv = data.last_openai.lock().await;
+            if last_inv.elapsed().as_secs() < cooldown_secs {
+                return Ok(());
+            }
+            *last_inv = std::time::Instant::now();
+            drop(last_inv);
+
+            log::info!(
+                "OpenAI trigger from {} in channel {}: {}",
+                new_message.author.name,
+                new_message.channel_id,
+                new_message.content.trim()
+            );
+
+            let (bot_context, chat_model) = {
+                let cache = data.settings_cache.read().await;
+                (
+                    cache
+                        .get("ai_initial_prompt")
+                        .cloned()
+                        .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+                    cache
+                        .get("ai_chat_model")
+                        .cloned()
+                        .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+                )
+            };
+
+            let bot_name = ctx.cache.current_user().name.clone();
+            let mut messages = Vec::new();
+            let mut current_msg = new_message.clone();
+            let bot_id = ctx.cache.current_user().id;
+
+            // Traverse up the reply chain (limit to 10 for safety/tokens)
+            for _ in 0..10 {
+                if let Some(ref_msg) = &current_msg.referenced_message {
+                    let role = if ref_msg.author.id == bot_id {
+                        "assistant"
+                    } else {
+                        "user"
+                    };
+                    messages.push(ChatMessage {
+                        role: role.to_string(),
+                        name: Some(ref_msg.author.name.clone()),
+                        content: ref_msg.content.clone(),
+                    });
+                    current_msg = *ref_msg.clone();
+                } else {
+                    break;
+                }
+            }
+            messages.reverse(); // Reverse the history to be in chronological order
+
+            // Add the developer prompt at the very beginning
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "developer".to_string(),
+                    name: Some(bot_name),
+                    content: bot_context,
+                },
+            );
+
+            let prompt = new_message.content.trim();
+            if prompt.is_empty() {
                 return Ok(());
             }
 
-            let author_id_str = new_message.author.id.to_string();
-            let bot_id_str = ctx.cache.current_user().id.to_string();
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                name: Some(new_message.author.name.clone()),
+                content: prompt.to_string(),
+            });
 
-            // Update last message time
-            let _ = db::create_user_if_not_exists(&data.db_pool, &author_id_str).await;
-            let _ =
-                db::update_last_message(&data.db_pool, &author_id_str, chrono::Utc::now()).await;
-
-            // Store Markov
-            data.markov_repo
-                .store(&author_id_str, &bot_id_str, &new_message.content)
+            let _ = new_message
+                .react(ctx, serenity::all::ReactionType::Unicode("💭".to_string()))
                 .await;
+            let _typing = new_message.channel_id.start_typing(&ctx.http);
 
-            // OpenAI Reply Logic (AiListener.kt)
-            let self_id = ctx.cache.current_user().id;
-            let mentioned = new_message.mentions.iter().any(|u| u.id == self_id);
-            let replied = new_message
-                .referenced_message
-                .as_ref()
-                .map(|m| m.author.id == self_id)
-                .unwrap_or(false);
-
-            if mentioned || replied {
-                let cooldown_secs: u64 = {
-                    let cache = data.settings_cache.read().await;
-                    cache
-                        .get("ai_cooldown_seconds")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0)
-                };
-
-                let mut last_inv = data.last_openai.lock().await;
-                if last_inv.elapsed().as_secs() < cooldown_secs {
-                    return Ok(());
-                }
-                *last_inv = std::time::Instant::now();
-                drop(last_inv);
-
-                log::info!(
-                    "OpenAI trigger from {} in channel {}: {}",
-                    new_message.author.name,
-                    new_message.channel_id,
-                    new_message.content.trim()
-                );
-
-                let (bot_context, chat_model) = {
-                    let cache = data.settings_cache.read().await;
-                    (
-                        cache
-                            .get("ai_initial_prompt")
-                            .cloned()
-                            .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
-                        cache
-                            .get("ai_chat_model")
-                            .cloned()
-                            .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
-                    )
-                };
-
-                let bot_name = ctx.cache.current_user().name.clone();
-                let mut messages = Vec::new();
-                let mut current_msg = new_message.clone();
-                let bot_id = ctx.cache.current_user().id;
-
-                // Traverse up the reply chain (limit to 10 for safety/tokens)
-                for _ in 0..10 {
-                    if let Some(ref_msg) = &current_msg.referenced_message {
-                        let role = if ref_msg.author.id == bot_id {
-                            "assistant"
-                        } else {
-                            "user"
-                        };
-                        messages.push(ChatMessage {
-                            role: role.to_string(),
-                            name: Some(ref_msg.author.name.clone()),
-                            content: ref_msg.content.clone(),
-                        });
-                        current_msg = *ref_msg.clone();
-                    } else {
-                        break;
-                    }
-                }
-                messages.reverse(); // Reverse the history to be in chronological order
-
-                // Add the developer prompt at the very beginning
-                messages.insert(
-                    0,
-                    ChatMessage {
-                        role: "developer".to_string(),
-                        name: Some(bot_name),
-                        content: bot_context,
-                    },
-                );
-
-                let prompt = new_message.content.trim();
-                if prompt.is_empty() {
-                    return Ok(());
-                }
-
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    name: Some(new_message.author.name.clone()),
-                    content: prompt.to_string(),
-                });
-
-                let _ = new_message
-                    .react(ctx, serenity::all::ReactionType::Unicode("💭".to_string()))
-                    .await;
-                let _typing = new_message.channel_id.start_typing(&ctx.http);
-
-                match data.openai_client.create_chat(&chat_model, messages).await {
-                    Ok(response) => {
-                        if let Some(choice) = response.choices.get(0) {
-                            let content = &choice.message.content;
-                            if content.is_empty() {
-                                let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
-                                return Ok(());
-                            }
-
-                            // Discord 2000 char limit handling
-                            if content.len() <= 2000 {
-                                let _ = new_message.reply(ctx, content).await;
-                            } else {
-                                log::info!(
-                                    "OpenAI response too long ({} chars), splitting...",
-                                    content.len()
-                                );
-                                let mut start = 0;
-                                while start < content.len() {
-                                    let end = std::cmp::min(start + 2000, content.len());
-                                    let chunk = &content[start..end];
-                                    let _ = new_message.channel_id.say(ctx, chunk).await;
-                                    start = end;
-                                }
-                            }
-                            log::info!("OpenAI replied to {}", new_message.author.name);
+            match data.openai_client.create_chat(&chat_model, messages).await {
+                Ok(response) => {
+                    if let Some(choice) = response.choices.first() {
+                        let content = &choice.message.content;
+                        if content.is_empty() {
+                            let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
+                            return Ok(());
                         }
+
+                        // Discord 2000 char limit handling
+                        if content.len() <= 2000 {
+                            let _ = new_message.reply(ctx, content).await;
+                        } else {
+                            log::info!(
+                                "OpenAI response too long ({} chars), splitting...",
+                                content.len()
+                            );
+                            let mut start = 0;
+                            while start < content.len() {
+                                let end = std::cmp::min(start + 2000, content.len());
+                                let chunk = &content[start..end];
+                                let _ = new_message.channel_id.say(ctx, chunk).await;
+                                start = end;
+                            }
+                        }
+                        log::info!("OpenAI replied to {}", new_message.author.name);
                     }
-                    Err(e) => {
-                        log::error!("OpenAI API error: {:?}", e);
-                        let _ = new_message
-                            .reply(ctx, "An error occurred while communicating with OpenAI")
-                            .await;
-                    }
+                }
+                Err(e) => {
+                    log::error!("OpenAI API error: {:?}", e);
+                    let _ = new_message
+                        .reply(ctx, "An error occurred while communicating with OpenAI")
+                        .await;
                 }
             }
         }
-        _ => {}
     }
     Ok(())
 }

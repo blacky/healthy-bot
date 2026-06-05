@@ -63,7 +63,7 @@ async fn announce_reminders(
 
     let channel_id_str = db::get_setting(pool, "main_text_channel")
         .await
-        .ok_or_else(|| "main_text_channel not set")?;
+        .ok_or("main_text_channel not set")?;
     let channel_id: u64 = channel_id_str.parse()?;
 
     let mut embed = create_embed("Reminders");
@@ -96,7 +96,7 @@ async fn update_reminders_vc(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let category_id_str = db::get_setting(pool, "reminder_category")
         .await
-        .ok_or_else(|| "reminder_category not set")?;
+        .ok_or("reminder_category not set")?;
     let category_id: u64 = category_id_str.parse()?;
     let guild_id_str = std::env::var("DISCORD_GUILD_ID")?;
     let guild_id: u64 = guild_id_str.parse()?;
