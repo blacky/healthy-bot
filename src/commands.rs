@@ -219,18 +219,11 @@ pub async fn markov(ctx: Context<'_>, user: Option<serenity::User>) -> Result<()
     let target_id = user
         .map(|u| u.id.to_string())
         .unwrap_or_else(|| ctx.author().id.to_string());
-    let markovs = ctx.data().markov_repo.markovs.read().await;
-
-    if let Some(markov) = markovs.get(&target_id) {
-        if let Some(generated) = markov.generate() {
-            log::info!("Markov generated for {}: {}", target_id, generated);
-            ctx.say(generated).await?;
-        } else {
-            log::warn!("Markov generation failed for {}", target_id);
-            ctx.say("Crack cocaine").await?;
-        }
+    if let Some(generated) = ctx.data().markov_repo.generate(&target_id).await {
+        log::info!("Markov generated for {}: {}", target_id, generated);
+        ctx.say(generated).await?;
     } else {
-        log::warn!("No Markov data found for {}", target_id);
+        log::warn!("Markov generation failed or no data for {}", target_id);
         ctx.say("Crack cocaine").await?;
     }
     Ok(())

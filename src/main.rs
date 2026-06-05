@@ -226,7 +226,7 @@ async fn main() {
     let settings_cache = Arc::new(RwLock::new(cache_map));
 
     log::info!("Loading Markov repository...");
-    let markov_repo = MarkovRepository::new("/healthybot/data/markovs");
+    let markov_repo = MarkovRepository::new(pool.clone(), "/healthybot/data/markovs").await;
 
     let openai_client = OpenAIClient::new(openai_key);
 
