@@ -126,7 +126,7 @@ async fn update_reminders_vc(
     let channels = guild.channels(http).await?;
 
     let mut existing_vcs = Vec::new();
-    for (_, channel) in &channels {
+    for channel in channels.values() {
         if let Some(parent) = channel.parent_id {
             if parent.get() == category_id && channel.kind == ChannelType::Voice {
                 existing_vcs.push(channel.clone());
