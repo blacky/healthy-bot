@@ -1,0 +1,20 @@
+services:
+  healthy-bot:
+    container_name: healthy-bot-dev
+    image: healthy-bot-dev:latest
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - /opt/containers/healthy-bot-dev/data:/healthybot/data
+      - /opt/containers/healthy-bot-dev/db:/healthybot/db
+    restart: unless-stopped
+  
+  # The restarter was likely used to manage JVM memory leaks or occasional crashes. 
+  # Rust is much more stable and memory-efficient, so this is likely redundant now, 
+  # but I've kept it here to maintain your exact deployment environment.
+  restarter:
+    image: docker
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    command: ["/bin/sh", "-c", "while true; do sleep 3600; docker restart healthy-bot; done"]
+    restart: unless-stopped
