@@ -3,8 +3,18 @@ name: Rust CI
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - 'Dockerfile'
+      - 'compose.yaml'
+      - '.gitignore'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - 'Dockerfile'
+      - 'compose.yaml'
+      - '.gitignore'
 
 env:
   CARGO_TERM_COLOR: always
