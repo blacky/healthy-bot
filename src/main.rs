@@ -146,7 +146,10 @@ async fn event_handler(
                             );
                             let mut start = 0;
                             while start < content.len() {
-                                let end = std::cmp::min(start + 2000, content.len());
+                                let mut end = std::cmp::min(start + 2000, content.len());
+                                while !content.is_char_boundary(end) {
+                                    end -= 1;
+                                }
                                 let chunk = &content[start..end];
                                 let _ = new_message.channel_id.say(ctx, chunk).await;
                                 start = end;
