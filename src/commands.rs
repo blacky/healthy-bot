@@ -10,6 +10,37 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 
 const HOF_ROLE_ID: u64 = 446675275179098113;
 
+#[derive(Debug, PartialEq)]
+pub struct ParsedReminder {
+    pub message: String,
+    pub datetime_utc: chrono::DateTime<Utc>,
+}
+
+pub fn parse_reminder_input(input: &str) -> Vec<ParsedReminder> {
+    input
+        .split([';', '\n'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|msg| {
+            let actions: Vec<&str> = msg.split_whitespace().collect();
+            if actions.len() < 3 {
+                return None;
+            }
+
+            let datetime_str = format!("{} {}", actions[0], actions[1]);
+            if let Ok(datetime) = NaiveDateTime::parse_from_str(&datetime_str, "%d-%m-%Y %H:%M") {
+                if let Some(datetime_tz) = Amsterdam.from_local_datetime(&datetime).single() {
+                    return Some(ParsedReminder {
+                        message: actions[2..].join(" "),
+                        datetime_utc: datetime_tz.with_timezone(&Utc),
+                    });
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 fn create_embed(title: &str) -> CreateEmbed {
     CreateEmbed::new()
         .title(title)
@@ -143,37 +174,19 @@ pub async fn remind_cmd(
     };
 
     if is_authorized {
-        let adds: Vec<&str> = input_val
-            .split([';', '\n'])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
+        let reminders = parse_reminder_input(&input_val);
         let mut created = 0;
 
-        for msg in adds {
-            let actions: Vec<&str> = msg.split_whitespace().collect();
-            if actions.len() < 3 {
-                continue;
-            }
-
-            let datetime_str = format!("{} {}", actions[0], actions[1]);
-            if let Ok(datetime) = NaiveDateTime::parse_from_str(&datetime_str, "%d-%m-%Y %H:%M") {
-                if let Some(datetime_tz) = Amsterdam.from_local_datetime(&datetime).single() {
-                    let datetime_utc = datetime_tz.with_timezone(&Utc);
-                    let message = actions[2..].join(" ");
-
-                    sqlx::query(
-                        "INSERT INTO reminder (message, date, owner_discord_id) VALUES (?, ?, ?)",
-                    )
-                    .bind(message)
-                    .bind(datetime_utc.timestamp_millis())
-                    .bind(&user_id)
-                    .execute(pool)
-                    .await?;
-                    created += 1;
-                }
-            }
+        for r in reminders {
+            sqlx::query(
+                "INSERT INTO reminder (message, date, owner_discord_id) VALUES (?, ?, ?)",
+            )
+            .bind(r.message)
+            .bind(r.datetime_utc.timestamp_millis())
+            .bind(&user_id)
+            .execute(pool)
+            .await?;
+            created += 1;
         }
 
         if created == 0 {
@@ -589,6 +602,37 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
         .map(|name| name.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_reminder_input_single() {
+        let input = "01-01-2023 12:00 do something";
+        let parsed = parse_reminder_input(input);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message, "do something");
+        // 12:00 Amsterdam is 11:00 UTC (Jan 1st)
+        assert_eq!(parsed[0].datetime_utc.timestamp(), 1672570800);
+    }
+
+    #[test]
+    fn test_parse_reminder_input_multiple() {
+        let input = "01-01-2023 12:00 first; 02-01-2023 13:00 second";
+        let parsed = parse_reminder_input(input);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].message, "first");
+        assert_eq!(parsed[1].message, "second");
+    }
+
+    #[test]
+    fn test_parse_reminder_input_invalid() {
+        let input = "invalid input";
+        let parsed = parse_reminder_input(input);
+        assert!(parsed.is_empty());
+    }
 }
 
 async fn autocomplete_settings_action(_ctx: Context<'_>, partial: &str) -> Vec<String> {

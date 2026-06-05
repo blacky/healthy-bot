@@ -184,3 +184,50 @@ impl MarkovRepository {
         capitalized
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_markov_add_phrase() {
+        let mut markov = Markov::default();
+        markov.add_phrase("hello world this is a test", 3);
+        
+        assert!(markov.chain.contains_key("_start"));
+        assert!(markov.chain.get("_start").unwrap().contains_key("hello"));
+        assert!(markov.chain.contains_key("hello"));
+        assert!(markov.chain.get("hello").unwrap().contains_key("world"));
+    }
+
+    #[test]
+    fn test_markov_min_words() {
+        let mut markov = Markov::default();
+        markov.add_phrase("too short", 3);
+        assert!(markov.chain.is_empty());
+    }
+
+    #[test]
+    fn test_markov_generate() {
+        let mut markov = Markov::default();
+        markov.add_phrase("the quick brown fox jumps over the lazy dog.", 3);
+        
+        let generated = markov.generate();
+        assert!(generated.is_some());
+        let phrase = generated.unwrap();
+        assert!(!phrase.is_empty());
+    }
+
+    #[test]
+    fn test_format_content() {
+        let repo = MarkovRepository {
+            storage_path: "test".to_string(),
+            markovs: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            last_save: std::sync::Arc::new(tokio::sync::Mutex::new(std::time::Instant::now())),
+        };
+
+        assert_eq!(repo.format_content("hello world"), "Hello world.");
+        assert_eq!(repo.format_content("<@12345> hello"), "Hello.");
+        assert_eq!(repo.format_content("Already capitalized."), "Already capitalized.");
+    }
+}

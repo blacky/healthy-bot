@@ -1,28 +1,11 @@
-mod commands;
-mod db;
-mod markov;
-mod openai;
-mod tasks;
-
-use crate::markov::MarkovRepository;
-use crate::openai::{ChatMessage, OpenAIClient};
+use healthy_bot::markov::MarkovRepository;
+use healthy_bot::openai::{ChatMessage, OpenAIClient};
+use healthy_bot::{commands, db, tasks, Data, Error};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-#[derive(Debug)]
-pub struct Data {
-    pub db_pool: SqlitePool,
-    pub markov_repo: MarkovRepository,
-    pub openai_client: OpenAIClient,
-    pub last_markov: tokio::sync::Mutex<std::time::Instant>,
-    pub last_openai: tokio::sync::Mutex<std::time::Instant>,
-    pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
-}
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
 
 async fn event_handler(
     ctx: &serenity::Context,
