@@ -32,7 +32,4 @@ RUN mkdir -p /healthybot/db /healthybot/data/markovs
 
 COPY --from=builder /app/target/release/healthy-bot /app/healthy-bot
 
-# Set production log level if not provided
-ENV RUST_LOG=info
-
 CMD ["/app/healthy-bot"]
