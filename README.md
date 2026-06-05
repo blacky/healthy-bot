@@ -7,15 +7,15 @@ A high-performance Discord bot rewritten in Rust, optimized for speed and memory
 This project is a complete refactor of the original [healthy-bot](https://github.com/buracc/healthy-bot), which was built using Kotlin, Spring Boot, and JDA.
 
 ### Why the change?
-The primary goal was to address high resource consumption. By moving to a native Rust implementation, we achieved significant optimizations:
-- **Memory Usage:** Peak memory usage dropped from 1.8GB (JVM) to just 350MB (Rust).
+The primary goal was to address high resource consumption. By moving to a native Rust implementation and migrating data structures to SQLite, we achieved massive optimizations:
+- **Memory Usage:** Peak memory usage dropped from 1.8GB (JVM) to just **~15MB** (Rust) during steady state.
 - **Startup Time:** Near-instantaneous startup compared to the Spring Boot overhead.
 - **Reliability:** Built-in memory safety and concurrency primitives of Rust ensure a stable long-running process.
 
 ## Core Features
 
 - **Reminders:** A flexible reminder system (!remind) to keep track of tasks, events, or anything else.
-- **Markov Chains:** Learns from user messages to generate hilarious (and often nonsensical) text chains (!markov).
+- **Markov Chains:** Learns from user messages to generate hilarious (and often nonsensical) text chains (!markov). Now fully database-backed for extreme memory efficiency.
 - **OpenAI Integration:** Context-aware replies using GPT models. It can follow reply chains and respond naturally to mentions.
 - **Member Management:** Track user activity ("Inthards") and manage authorized users.
 - **Dynamic Settings:** Configure bot behavior (cooldowns, prompts, status) on-the-fly via commands.
@@ -48,8 +48,8 @@ docker-compose up -d
 ```
 
 Ensure your volumes are mapped correctly for persistence:
-- `/healthybot/db`: Database storage.
-- `/healthybot/data`: Markov model data.
+- `/healthybot/db`: Database storage (includes Markov chains).
+- `/healthybot/data`: Legacy Markov model data for migration.
 
 ## Commands
 
