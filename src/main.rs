@@ -429,6 +429,32 @@ async fn main() {
         .await
         .unwrap();
 
+    let shard_manager = client.shard_manager.clone();
+
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+            tokio::select! {
+                _ = sigterm.recv() => log::info!("Received SIGTERM, shutting down..."),
+                _ = sigint.recv() => log::info!("Received SIGINT, shutting down..."),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.unwrap();
+            log::info!("Received Ctrl-C, shutting down...");
+        }
+
+        shard_manager.shutdown_all().await;
+    });
+
     log::info!("Starting client...");
-    client.start().await.unwrap();
+    if let Err(why) = client.start().await {
+        log::error!("Client error: {:?}", why);
+    }
 }
