@@ -249,18 +249,17 @@ pub async fn settings(
 
     if action.as_deref() == Some("set") {
         let is_admin = {
-            let is_owner = ctx
-                .guild()
-                .map(|g| g.owner_id == ctx.author().id)
-                .unwrap_or(false);
-            let has_admin = match ctx.author_member().await {
-                Some(member) => member
-                    .permissions
-                    .map(|p| p.administrator())
-                    .unwrap_or(false),
-                None => false,
-            };
-            is_owner || has_admin
+            let mut admin = false;
+            let member = ctx.author_member().await;
+
+            if let Some(guild) = ctx.guild() {
+                if guild.owner_id == ctx.author().id {
+                    admin = true;
+                } else if let Some(m) = member {
+                    admin = guild.member_permissions(&m).administrator();
+                }
+            }
+            admin
         };
 
         if !is_admin {
