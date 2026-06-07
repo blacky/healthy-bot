@@ -1,6 +1,6 @@
 use crate::db;
 use crate::Data;
-use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono::{LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
 use poise::serenity_prelude as serenity;
 use serenity::builder::{CreateEmbed, CreateEmbedFooter};
@@ -29,10 +29,21 @@ pub fn parse_reminder_input(input: &str) -> Vec<ParsedReminder> {
 
             let datetime_str = format!("{} {}", actions[0], actions[1]);
             if let Ok(datetime) = NaiveDateTime::parse_from_str(&datetime_str, "%d-%m-%Y %H:%M") {
-                if let Some(datetime_tz) = Amsterdam.from_local_datetime(&datetime).single() {
+                let datetime_tz = match Amsterdam.from_local_datetime(&datetime) {
+                    LocalResult::Single(t) => Some(t),
+                    LocalResult::Ambiguous(t1, _) => Some(t1),
+                    LocalResult::None => {
+                        // Spring forward gap: add 1 hour and try again
+                        Amsterdam
+                            .from_local_datetime(&(datetime + chrono::Duration::hours(1)))
+                            .earliest()
+                    }
+                };
+
+                if let Some(dt_tz) = datetime_tz {
                     return Some(ParsedReminder {
                         message: actions[2..].join(" "),
-                        datetime_utc: datetime_tz.with_timezone(&Utc),
+                        datetime_utc: dt_tz.with_timezone(&Utc),
                     });
                 }
             }
@@ -631,6 +642,34 @@ mod tests {
         let input = "invalid input";
         let parsed = parse_reminder_input(input);
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_parse_reminder_input_dst_spring_forward() {
+        // In 2024, Amsterdam clocks spring forward on March 31 at 02:00.
+        // 02:30:00 does not exist.
+        let input = "31-03-2024 02:30 Spring Forward";
+        let parsed = parse_reminder_input(input);
+        assert_eq!(parsed.len(), 1);
+        // Should be shifted to 03:30 local, which is 01:30 UTC
+        assert_eq!(
+            parsed[0].datetime_utc.format("%Y-%m-%d %H:%M").to_string(),
+            "2024-03-31 01:30"
+        );
+    }
+
+    #[test]
+    fn test_parse_reminder_input_dst_fall_backward() {
+        // In 2024, Amsterdam clocks fall back on October 27 at 03:00.
+        // 02:30:00 happens twice.
+        let input = "27-10-2024 02:30 Fall Backward";
+        let parsed = parse_reminder_input(input);
+        assert_eq!(parsed.len(), 1);
+        // Should pick first occurrence (CEST), which is 00:30 UTC
+        assert_eq!(
+            parsed[0].datetime_utc.format("%Y-%m-%d %H:%M").to_string(),
+            "2024-10-27 00:30"
+        );
     }
 }
 
