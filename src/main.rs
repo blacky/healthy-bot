@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+type Context<'a> = poise::Context<'a, Data, Error>;
+
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -14,7 +16,17 @@ async fn event_handler(
     data: &Data,
 ) -> Result<(), Error> {
     if let serenity::FullEvent::Message { new_message } = event {
-        if new_message.author.bot {
+        let is_allowed_bot = if new_message.author.bot {
+            let cache = data.settings_cache.read().await;
+            cache
+                .get("allowed_bot_id")
+                .map(|id| id == &new_message.author.id.to_string())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if new_message.author.bot && !is_allowed_bot {
             return Ok(());
         }
 
@@ -29,6 +41,10 @@ async fn event_handler(
         data.markov_repo
             .store(&author_id_str, &bot_id_str, &new_message.content)
             .await;
+
+        if new_message.author.bot {
+            return Ok(());
+        }
 
         // OpenAI Reply Logic (AiListener.kt)
         let self_id = ctx.cache.current_user().id;
@@ -248,6 +264,19 @@ async fn main() {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
+            command_check: Some(|ctx: Context<'_>| {
+                Box::pin(async move {
+                    if ctx.author().bot {
+                        let cache = ctx.data().settings_cache.read().await;
+                        let is_allowed = cache
+                            .get("allowed_bot_id")
+                            .map(|id| id == &ctx.author().id.to_string())
+                            .unwrap_or(false);
+                        return Ok(is_allowed && ctx.command().name == "markov");
+                    }
+                    Ok(true)
+                })
+            }),
             owners: {
                 let mut owners = std::collections::HashSet::new();
                 owners.insert(serenity::UserId::new(210531463932674050));
@@ -320,6 +349,7 @@ async fn main() {
             },
             prefix_options: poise::PrefixFrameworkOptions {
                 prefix: Some("!".into()), // Default prefix
+                ignore_bots: false,
                 dynamic_prefix: Some(|ctx| {
                     Box::pin(async move {
                         let cache = ctx.data.settings_cache.read().await;

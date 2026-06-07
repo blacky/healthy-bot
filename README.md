@@ -58,3 +58,17 @@ Ensure your volumes are mapped correctly for persistence:
 - `!user inthards`: View the top list of inactive users.
 - `!settings`: View or modify bot configuration.
 - `!help`: Show this message.
+
+## Bot Exception
+
+If you want to allow another bot in your server to use `!markov` and have its messages tracked in the database, you can set the `allowed_bot_id` setting:
+
+```bash
+!settings set allowed_bot_id 123456789012345678
+```
+
+This will allow that specific bot to:
+- Contribute to Markov chain word-pairs.
+- Trigger the `!markov` command.
+
+All other commands and AI interactions remain restricted for all bots.

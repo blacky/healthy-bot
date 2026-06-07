@@ -475,9 +475,17 @@ pub async fn user_cmd(
                 let guild_id = ctx.guild_id().ok_or("Must be run in a guild")?;
                 let mut synced_count = 0;
 
+                let allowed_bot_id = {
+                    let cache = ctx.data().settings_cache.read().await;
+                    cache.get("allowed_bot_id").cloned()
+                };
+
                 let members = guild_id.members(ctx.http(), None, None).await?;
                 for member in members {
-                    if !member.user.bot {
+                    let is_allowed_bot =
+                        allowed_bot_id.as_deref() == Some(&member.user.id.to_string());
+
+                    if !member.user.bot || is_allowed_bot {
                         let _ =
                             db::create_user_if_not_exists(pool, &member.user.id.to_string()).await;
                         synced_count += 1;
@@ -588,6 +596,7 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "ai_chat_model",
         "bot_status_type",
         "bot_status_message",
+        "allowed_bot_id",
     ];
     keys.into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
