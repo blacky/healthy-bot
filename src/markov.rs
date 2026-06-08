@@ -44,6 +44,19 @@ impl MarkovRepository {
         )
         .execute(&self.pool)
         .await;
+
+        // Cleanup empty or whitespace words that might have been migrated from legacy
+        let res = sqlx::query(
+            "DELETE FROM markov_model WHERE word1 = '' OR word2 = '' OR word1 IS NULL OR word2 IS NULL OR TRIM(word1) = '' OR TRIM(word2) = ''"
+        )
+        .execute(&self.pool)
+        .await;
+
+        if let Ok(r) = res {
+            if r.rows_affected() > 0 {
+                log::info!("Cleaned up {} empty Markov entries.", r.rows_affected());
+            }
+        }
     }
 
     async fn migrate_legacy(&self, path: &str) {
@@ -123,19 +136,27 @@ impl MarkovRepository {
         }
 
         for (index, &word) in words.iter().enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+
             let mut entries = Vec::new();
             if index == 0 {
                 entries.push(("_start", word));
-                if index != words.len() - 1 {
+                if index < words.len() - 1 {
                     entries.push((word, words[index + 1]));
                 }
             } else if index == words.len() - 1 {
-                entries.push(("_end", word));
+                entries.push((word, "_end"));
             } else {
                 entries.push((word, words[index + 1]));
             }
 
             for (w1, w2) in entries {
+                if w1.is_empty() || w2.is_empty() {
+                    continue;
+                }
+
                 for id in [user_id, bot_id] {
                     let _ = sqlx::query(
                         "INSERT INTO markov_model (user_id, word1, word2, count) 
@@ -155,13 +176,19 @@ impl MarkovRepository {
     pub async fn generate(&self, user_id: &str) -> Option<String> {
         let mut phrase = Vec::new();
         let mut word = self.pick_next(user_id, "_start").await?;
+        if word.is_empty() || word == "_end" {
+            return None;
+        }
         phrase.push(word.clone());
 
         let mention_regex = regex::Regex::new(r"<(@[!&]?|#)\d+>").unwrap();
 
-        while !word.is_empty() && !word.ends_with(['.', '?', '!']) {
+        while !word.is_empty() && !word.ends_with(['.', '?', '!']) && word != "_end" {
             if let Some(next_word) = self.pick_next(user_id, &word).await {
                 word = next_word;
+                if word == "_end" || word.is_empty() {
+                    break;
+                }
                 phrase.push(word.clone());
                 if phrase.len() > 50 {
                     break;
@@ -173,7 +200,7 @@ impl MarkovRepository {
 
         let result = phrase
             .into_iter()
-            .filter(|w| !mention_regex.is_match(w))
+            .filter(|w| !mention_regex.is_match(w) && w != "_end" && !w.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
 
