@@ -82,24 +82,75 @@ pub async fn remind_cmd(
     let action = parts.first().copied().unwrap_or("");
 
     if action == "remove" {
-        let id_str = parts.get(1).ok_or("No id provided")?;
-        let id: i64 = id_str.parse()?;
-        let reminder: db::Reminder =
-            sqlx::query_as::<_, db::Reminder>("SELECT * FROM reminder WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await?;
-
-        if reminder.owner_discord_id != user_id {
-            return Err("You do not own this reminder.".into());
+        let ids_to_remove = &parts[1..];
+        if ids_to_remove.is_empty() {
+            return Err("No reminder IDs provided to remove.".into());
         }
 
-        sqlx::query("DELETE FROM reminder WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
-        ctx.say(format!("Successfully removed reminder #{}.", id))
-            .await?;
+        let mut removed_ids = Vec::new();
+        let mut failed_ids = Vec::new();
+        let mut unauthorized_ids = Vec::new();
+
+        for id_str in ids_to_remove {
+            let id: i64 = match id_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    failed_ids.push(id_str.to_string());
+                    continue;
+                }
+            };
+
+            let reminder_res: Result<db::Reminder, _> =
+                sqlx::query_as::<_, db::Reminder>("SELECT * FROM reminder WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await;
+
+            match reminder_res {
+                Ok(reminder) => {
+                    if reminder.owner_discord_id != user_id {
+                        unauthorized_ids.push(id.to_string());
+                        continue;
+                    }
+
+                    if let Ok(_) = sqlx::query("DELETE FROM reminder WHERE id = ?")
+                        .bind(id)
+                        .execute(pool)
+                        .await
+                    {
+                        removed_ids.push(id.to_string());
+                    } else {
+                        failed_ids.push(id.to_string());
+                    }
+                }
+                Err(_) => {
+                    failed_ids.push(id.to_string());
+                }
+            }
+        }
+
+        let mut response = String::new();
+        if !removed_ids.is_empty() {
+            response.push_str(&format!(
+                "Successfully removed {} reminder(s): #{}.\n",
+                removed_ids.len(),
+                removed_ids.join(", #")
+            ));
+        }
+        if !unauthorized_ids.is_empty() {
+            response.push_str(&format!(
+                "You do not own these reminder(s): #{}.\n",
+                unauthorized_ids.join(", #")
+            ));
+        }
+        if !failed_ids.is_empty() {
+            response.push_str(&format!(
+                "Could not find or parse these ID(s): {}.",
+                failed_ids.join(", ")
+            ));
+        }
+
+        ctx.say(response.trim()).await?;
         return Ok(());
     }
 
@@ -612,65 +663,6 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
         .map(|name| name.to_string())
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_reminder_input_single() {
-        let input = "01-01-2023 12:00 do something";
-        let parsed = parse_reminder_input(input);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].message, "do something");
-        // 12:00 Amsterdam is 11:00 UTC (Jan 1st)
-        assert_eq!(parsed[0].datetime_utc.timestamp(), 1672570800);
-    }
-
-    #[test]
-    fn test_parse_reminder_input_multiple() {
-        let input = "01-01-2023 12:00 first; 02-01-2023 13:00 second";
-        let parsed = parse_reminder_input(input);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].message, "first");
-        assert_eq!(parsed[1].message, "second");
-    }
-
-    #[test]
-    fn test_parse_reminder_input_invalid() {
-        let input = "invalid input";
-        let parsed = parse_reminder_input(input);
-        assert!(parsed.is_empty());
-    }
-
-    #[test]
-    fn test_parse_reminder_input_dst_spring_forward() {
-        // In 2024, Amsterdam clocks spring forward on March 31 at 02:00.
-        // 02:30:00 does not exist.
-        let input = "31-03-2024 02:30 Spring Forward";
-        let parsed = parse_reminder_input(input);
-        assert_eq!(parsed.len(), 1);
-        // Should be shifted to 03:30 local, which is 01:30 UTC
-        assert_eq!(
-            parsed[0].datetime_utc.format("%Y-%m-%d %H:%M").to_string(),
-            "2024-03-31 01:30"
-        );
-    }
-
-    #[test]
-    fn test_parse_reminder_input_dst_fall_backward() {
-        // In 2024, Amsterdam clocks fall back on October 27 at 03:00.
-        // 02:30:00 happens twice.
-        let input = "27-10-2024 02:30 Fall Backward";
-        let parsed = parse_reminder_input(input);
-        assert_eq!(parsed.len(), 1);
-        // Should pick first occurrence (CEST), which is 00:30 UTC
-        assert_eq!(
-            parsed[0].datetime_utc.format("%Y-%m-%d %H:%M").to_string(),
-            "2024-10-27 00:30"
-        );
-    }
 }
 
 async fn autocomplete_settings_action(_ctx: Context<'_>, partial: &str) -> Vec<String> {

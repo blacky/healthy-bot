@@ -86,3 +86,33 @@ async fn test_db_settings() {
     let non_existent = db::get_setting(&pool, "none").await;
     assert_eq!(non_existent, None);
 }
+
+#[test]
+fn test_to_utc_seconds() {
+    let ts = 1672531200; // 2023-01-01 00:00:00 UTC
+    let dt = db::to_utc(ts);
+    assert_eq!(dt.timestamp(), ts);
+    assert_eq!(dt.timestamp_subsec_millis(), 0);
+}
+
+#[test]
+fn test_to_utc_milliseconds() {
+    let ts = 1672531200123; // 2023-01-01 00:00:00.123 UTC
+    let dt = db::to_utc(ts);
+    assert_eq!(dt.timestamp(), 1672531200);
+    assert_eq!(dt.timestamp_subsec_millis(), 123);
+}
+
+#[test]
+fn test_to_utc_boundary() {
+    // Just below 10_000_000_000 should be treated as seconds
+    let ts = 9_999_999_999;
+    let dt = db::to_utc(ts);
+    assert_eq!(dt.timestamp(), ts);
+
+    // Exactly 10_000_000_001 should be treated as milliseconds
+    let ts_ms = 10_000_000_001;
+    let dt_ms = db::to_utc(ts_ms);
+    assert_eq!(dt_ms.timestamp(), 10_000_000);
+    assert_eq!(dt_ms.timestamp_subsec_millis(), 1);
+}
