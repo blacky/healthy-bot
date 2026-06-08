@@ -113,10 +113,11 @@ pub async fn remind_cmd(
                         continue;
                     }
 
-                    if let Ok(_) = sqlx::query("DELETE FROM reminder WHERE id = ?")
+                    if sqlx::query("DELETE FROM reminder WHERE id = ?")
                         .bind(id)
                         .execute(pool)
                         .await
+                        .is_ok()
                     {
                         removed_ids.push(id.to_string());
                     } else {
