@@ -195,7 +195,10 @@ async fn update_reminders_vc(
                 desired_names[i]
             );
             if let Err(e) = existing_vcs[i]
-                .edit(http, serenity::all::EditChannel::new().name(&desired_names[i]))
+                .edit(
+                    http,
+                    serenity::all::EditChannel::new().name(&desired_names[i]),
+                )
                 .await
             {
                 log::error!("Failed to rename VC reminder: {:?}", e);

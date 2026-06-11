@@ -224,10 +224,7 @@ pub async fn remind_cmd(
             Some(member) => member.roles.iter().any(|r| r.get() == HOF_ROLE_ID),
             None => false,
         };
-        is_server_admin(ctx).await
-            || user.role == "ADMIN"
-            || user.authorized
-            || has_hof
+        is_server_admin(ctx).await || user.role == "ADMIN" || user.authorized || has_hof
     };
 
     if is_authorized {
