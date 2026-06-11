@@ -1,4 +1,6 @@
 use crate::db;
+use crate::truncate_str;
+use crate::user_error;
 use crate::Data;
 use chrono::{LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
@@ -84,7 +86,7 @@ pub async fn remind_cmd(
     if action == "remove" {
         let ids_to_remove = &parts[1..];
         if ids_to_remove.is_empty() {
-            return Err("No reminder IDs provided to remove.".into());
+            return Err(user_error("No reminder IDs provided to remove."));
         }
 
         let mut removed_ids = Vec::new();
@@ -207,7 +209,7 @@ pub async fn remind_cmd(
         reminders.sort_by_key(|r| r.date);
         for r in reminders.iter().take(25) {
             embed = embed.field(
-                format!("#{}. {}", r.id, r.message.trim()),
+                truncate_str(&format!("#{}. {}", r.id, r.message.trim()), 256),
                 format!("<t:{}>", r.date_utc().timestamp()),
                 false,
             );
@@ -218,22 +220,11 @@ pub async fn remind_cmd(
 
     // Add reminder logic
     let is_authorized = {
-        let is_owner = ctx
-            .guild()
-            .map(|g| g.owner_id == ctx.author().id)
-            .unwrap_or(false);
-        let has_admin = match ctx.author_member().await {
-            Some(member) => member
-                .permissions
-                .map(|p| p.administrator())
-                .unwrap_or(false),
-            None => false,
-        };
         let has_hof = match ctx.author_member().await {
             Some(member) => member.roles.iter().any(|r| r.get() == HOF_ROLE_ID),
             None => false,
         };
-        is_owner || has_admin || user.role == "ADMIN" || user.authorized || has_hof
+        is_server_admin(ctx).await || user.role == "ADMIN" || user.authorized || has_hof
     };
 
     if is_authorized {
@@ -251,14 +242,14 @@ pub async fn remind_cmd(
         }
 
         if created == 0 {
-            return Err("Failed to parse reminder. Make sure the formatting is correct (eg. 30-09-2022 19:24 message).".into());
+            return Err(user_error("Failed to parse reminder. Make sure the formatting is correct (eg. 30-09-2022 19:24 message)."));
         }
 
         ctx.say(format!("Created {} reminders.", created)).await?;
         return Ok(());
     }
 
-    Err("You are not authorized to use this command.".into())
+    Err(user_error("You are not authorized to use this command."))
 }
 
 /// Generate a markov chain message for a user
@@ -311,25 +302,11 @@ pub async fn settings(
     db::create_user_if_not_exists(pool, &user_id).await?;
 
     if action.as_deref() == Some("set") {
-        let is_admin = {
-            let mut admin = false;
-            let member = ctx.author_member().await;
-
-            if let Some(guild) = ctx.guild() {
-                if guild.owner_id == ctx.author().id {
-                    admin = true;
-                } else if let Some(m) = member {
-                    admin = guild.member_permissions(&m).administrator();
-                }
-            }
-            admin
-        };
-
-        if !is_admin {
-            return Err("You are not authorized to change settings.".into());
+        if !is_server_admin(ctx).await {
+            return Err(user_error("You are not authorized to change settings."));
         }
-        let key = key.ok_or("No key supplied")?;
-        let value = value.ok_or("No value supplied")?;
+        let key = key.ok_or_else(|| user_error("No key supplied"))?;
+        let value = value.ok_or_else(|| user_error("No value supplied"))?;
 
         sqlx::query("INSERT INTO setting (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = ?")
             .bind(&key)
@@ -352,7 +329,7 @@ pub async fn settings(
 
         let mut embed = create_embed("HealthyBot Settings");
         for s in settings {
-            embed = embed.field(s.k, s.v, false);
+            embed = embed.field(truncate_str(&s.k, 256), truncate_str(&s.v, 1024), false);
         }
         ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
@@ -373,22 +350,8 @@ pub async fn status(
     let pool = &ctx.data().db_pool;
 
     // Check permissions
-    let is_admin = {
-        let is_owner = ctx
-            .guild()
-            .map(|g| g.owner_id == ctx.author().id)
-            .unwrap_or(false);
-        let has_admin = match ctx.author_member().await {
-            Some(member) => member
-                .permissions
-                .map(|p| p.administrator())
-                .unwrap_or(false),
-            None => false,
-        };
-        is_owner || has_admin
-    };
-    if !is_admin {
-        return Err("You are not authorized to change status.".into());
+    if !is_server_admin(ctx).await {
+        return Err(user_error("You are not authorized to change status."));
     }
 
     let (activity_type, message) = match activity_type.to_lowercase().as_str() {
@@ -444,167 +407,199 @@ pub async fn status(
     Ok(())
 }
 
+/// Whether the invoking user is a server admin: the guild owner, or a member
+/// with the Administrator permission.
+///
+/// Permissions are computed from the member's roles via `member_permissions`,
+/// which works for both prefix and slash commands — unlike the `Member`
+/// `permissions` field, which Discord only populates for slash interactions.
+async fn is_server_admin(ctx: Context<'_>) -> bool {
+    // Server owner is always an admin.
+    if ctx
+        .guild()
+        .map(|g| g.owner_id == ctx.author().id)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    match ctx.author_member().await {
+        Some(member) => ctx
+            .guild()
+            .map(|guild| guild.member_permissions(&member).administrator())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Whether the invoking user may run the privileged `user` subcommands: a server
+/// admin, or a user with the ADMIN role in the database.
+async fn is_user_admin(ctx: Context<'_>) -> bool {
+    if is_server_admin(ctx).await {
+        return true;
+    }
+    db::get_user(&ctx.data().db_pool, &ctx.author().id.to_string())
+        .await
+        .map(|u| u.role == "ADMIN")
+        .unwrap_or(false)
+}
+
 /// User and database management commands
 #[poise::command(
     slash_command,
     prefix_command,
     rename = "user",
-    aliases("users", "inthards")
+    aliases("users"),
+    subcommands("authorize", "sync", "latest_message", "inthards")
 )]
-pub async fn user_cmd(
+pub async fn user_cmd(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.say("Available subcommands: `authorize`, `sync`, `latest_message`, `inthards`.")
+        .await?;
+    Ok(())
+}
+
+/// Toggle a user's authorized status (admin only)
+#[poise::command(slash_command, prefix_command)]
+pub async fn authorize(
     ctx: Context<'_>,
-    #[description = "Action (authorize, inthards, sync, latest_message)"]
-    #[autocomplete = "autocomplete_user_action"]
-    action: Option<String>,
-    #[rest]
-    #[description = "User or ID"]
-    arg: Option<String>,
+    #[description = "The user to toggle authorization for"] user: serenity::User,
+) -> Result<(), Error> {
+    if !is_user_admin(ctx).await {
+        return Err(user_error("Unauthorized"));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let target_id = user.id.to_string();
+    db::create_user_if_not_exists(pool, &target_id).await?;
+    sqlx::query("UPDATE users SET authorized = NOT authorized WHERE discord_id = ?")
+        .bind(&target_id)
+        .execute(pool)
+        .await?;
+
+    let target = db::get_user(pool, &target_id)
+        .await
+        .ok_or("Failed to load user after update")?;
+    ctx.say(format!(
+        "<@{}> is {} authorized.",
+        target_id,
+        if target.authorized {
+            "now"
+        } else {
+            "no longer"
+        }
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Sync guild members with the database (admin only)
+#[poise::command(slash_command, prefix_command)]
+pub async fn sync(ctx: Context<'_>) -> Result<(), Error> {
+    if !is_user_admin(ctx).await {
+        return Err(user_error("Unauthorized"));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| user_error("Must be run in a guild"))?;
+    let mut synced_count = 0;
+
+    let allowed_bot_id = {
+        let cache = ctx.data().settings_cache.read().await;
+        cache.get("allowed_bot_id").cloned()
+    };
+
+    let members = guild_id.members(ctx.http(), None, None).await?;
+    for member in members {
+        let is_allowed_bot = allowed_bot_id.as_deref() == Some(&member.user.id.to_string());
+
+        if !member.user.bot || is_allowed_bot {
+            let _ = db::create_user_if_not_exists(pool, &member.user.id.to_string()).await;
+            synced_count += 1;
+        } else {
+            let _ = sqlx::query("DELETE FROM users WHERE discord_id = ?")
+                .bind(member.user.id.to_string())
+                .execute(pool)
+                .await;
+        }
+    }
+
+    ctx.say(format!("Synced {} members with database.", synced_count))
+        .await?;
+    Ok(())
+}
+
+/// Show a user's most recent message in the main channel (admin only)
+#[poise::command(slash_command, prefix_command)]
+pub async fn latest_message(
+    ctx: Context<'_>,
+    #[description = "The user to look up"] user: serenity::User,
+) -> Result<(), Error> {
+    if !is_user_admin(ctx).await {
+        return Err(user_error("Unauthorized"));
+    }
+
+    let target_id = user.id.get();
+
+    let channel_id_str = {
+        let cache = ctx.data().settings_cache.read().await;
+        cache
+            .get("main_text_channel")
+            .cloned()
+            .ok_or_else(|| user_error("main_text_channel setting not found"))?
+    };
+    let channel_id: u64 = channel_id_str.parse()?;
+
+    let messages = serenity::ChannelId::new(channel_id)
+        .messages(ctx.http(), serenity::builder::GetMessages::new().limit(100))
+        .await?;
+
+    if let Some(msg) = messages.iter().find(|m| m.author.id.get() == target_id) {
+        ctx.say(format!(
+            "<@{}>'s latest message was: {} at <t:{}>",
+            target_id,
+            msg.content_safe(ctx.cache()),
+            msg.timestamp.unix_timestamp()
+        ))
+        .await?;
+    } else {
+        ctx.say(format!(
+            "No message found for member <@{}> in the last 100 messages.",
+            target_id
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Show the most inactive users
+#[poise::command(slash_command, prefix_command)]
+pub async fn inthards(
+    ctx: Context<'_>,
+    #[description = "How many users to show (default 5)"] count: Option<i64>,
 ) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
-    let cmd_name = ctx.command().name.as_str();
+    let top_x = count.unwrap_or(5).unsigned_abs() as i64;
 
-    if cmd_name == "inthards" || action.as_deref() == Some("inthards") {
-        let top_x = action
-            .as_deref()
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(5)
-            .unsigned_abs() as usize;
-        let users: Vec<db::User> =
-            sqlx::query_as::<_, db::User>("SELECT * FROM users ORDER BY last_message ASC LIMIT ?")
-                .bind(top_x as i32)
-                .fetch_all(pool)
-                .await?;
+    let users: Vec<db::User> =
+        sqlx::query_as::<_, db::User>("SELECT * FROM users ORDER BY last_message ASC LIMIT ?")
+            .bind(top_x)
+            .fetch_all(pool)
+            .await?;
 
-        let mut embed =
-            create_embed("Inthards Top List").description(format!("Top {} inactive inters", top_x));
+    let mut embed =
+        create_embed("Inthards Top List").description(format!("Top {} inactive inters", top_x));
 
-        for (idx, user) in users.iter().enumerate() {
-            let ts = user.last_message_utc().map(|m| m.timestamp()).unwrap_or(0);
-            embed = embed.field(
-                format!("{}.", idx + 1),
-                format!("<@{}>: <t:{}:R>", user.discord_id, ts),
-                false,
-            );
-        }
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
-        return Ok(());
+    for (idx, user) in users.iter().enumerate() {
+        let ts = user.last_message_utc().map(|m| m.timestamp()).unwrap_or(0);
+        embed = embed.field(
+            format!("{}.", idx + 1),
+            format!("<@{}>: <t:{}:R>", user.discord_id, ts),
+            false,
+        );
     }
-
-    match action.as_deref() {
-        Some("authorize") | Some("sync") | Some("latest_message") => {
-            let is_admin = {
-                let is_owner = ctx
-                    .guild()
-                    .map(|g| g.owner_id == ctx.author().id)
-                    .unwrap_or(false);
-                let has_admin = match ctx.author_member().await {
-                    Some(member) => member
-                        .permissions
-                        .map(|p| p.administrator())
-                        .unwrap_or(false),
-                    None => false,
-                };
-                let db_admin = db::get_user(pool, &ctx.author().id.to_string())
-                    .await
-                    .map(|u| u.role == "ADMIN")
-                    .unwrap_or(false);
-                is_owner || has_admin || db_admin
-            };
-
-            if !is_admin {
-                return Err("Unauthorized".into());
-            }
-
-            if action.as_deref() == Some("authorize") {
-                let target_id = arg.ok_or("No user id specified")?;
-                db::create_user_if_not_exists(pool, &target_id).await?;
-                sqlx::query("UPDATE users SET authorized = NOT authorized WHERE discord_id = ?")
-                    .bind(&target_id)
-                    .execute(pool)
-                    .await?;
-                let target = db::get_user(pool, &target_id).await.unwrap();
-                ctx.say(format!(
-                    "<@{}> is {} authorized.",
-                    target_id,
-                    if target.authorized {
-                        "now"
-                    } else {
-                        "no longer"
-                    }
-                ))
-                .await?;
-            } else if action.as_deref() == Some("sync") {
-                let guild_id = ctx.guild_id().ok_or("Must be run in a guild")?;
-                let mut synced_count = 0;
-
-                let allowed_bot_id = {
-                    let cache = ctx.data().settings_cache.read().await;
-                    cache.get("allowed_bot_id").cloned()
-                };
-
-                let members = guild_id.members(ctx.http(), None, None).await?;
-                for member in members {
-                    let is_allowed_bot =
-                        allowed_bot_id.as_deref() == Some(&member.user.id.to_string());
-
-                    if !member.user.bot || is_allowed_bot {
-                        let _ =
-                            db::create_user_if_not_exists(pool, &member.user.id.to_string()).await;
-                        synced_count += 1;
-                    } else {
-                        let _ = sqlx::query("DELETE FROM users WHERE discord_id = ?")
-                            .bind(member.user.id.to_string())
-                            .execute(pool)
-                            .await;
-                    }
-                }
-
-                ctx.say(format!("Synced {} members with database.", synced_count))
-                    .await?;
-            } else if action.as_deref() == Some("latest_message") {
-                let target_id_str = arg.ok_or("No user id specified")?;
-                let target_id: u64 = target_id_str
-                    .replace("<@", "")
-                    .replace(">", "")
-                    .replace("!", "")
-                    .parse()?;
-
-                let channel_id_str = {
-                    let cache = ctx.data().settings_cache.read().await;
-                    cache
-                        .get("main_text_channel")
-                        .cloned()
-                        .ok_or("main_text_channel setting not found")?
-                };
-                let channel_id: u64 = channel_id_str.parse()?;
-
-                let messages = serenity::ChannelId::new(channel_id)
-                    .messages(ctx.http(), serenity::builder::GetMessages::new().limit(100))
-                    .await?;
-
-                if let Some(msg) = messages.iter().find(|m| m.author.id.get() == target_id) {
-                    ctx.say(format!(
-                        "<@{}>'s latest message was: {} at <t:{}>",
-                        target_id,
-                        msg.content_safe(ctx.cache()),
-                        msg.timestamp.unix_timestamp()
-                    ))
-                    .await?;
-                } else {
-                    ctx.say(format!(
-                        "No message found for member <@{}> in the last 100 messages.",
-                        target_id
-                    ))
-                    .await?;
-                }
-            }
-        }
-        _ => {
-            ctx.say("Invalid action. Available: authorize, inthards, sync, latest_message")
-                .await?;
-        }
-    }
-
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
@@ -638,9 +633,9 @@ pub async fn register(ctx: Context<'_>) -> Result<(), Error> {
     let is_authorized_user = ctx.author().id.get() == 210531463932674050;
 
     if !is_owner && !is_authorized_user {
-        return Err(
-            "Only the server owner or authorized administrators can register commands.".into(),
-        );
+        return Err(user_error(
+            "Only the server owner or authorized administrators can register commands.",
+        ));
     }
 
     poise::builtins::register_application_commands_buttons(ctx).await?;
@@ -676,14 +671,6 @@ async fn autocomplete_settings_action(_ctx: Context<'_>, partial: &str) -> Vec<S
 
 async fn autocomplete_status(_ctx: Context<'_>, partial: &str) -> Vec<String> {
     vec!["playing", "watching", "listening", "competing", "custom"]
-        .into_iter()
-        .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
-        .map(|name| name.to_string())
-        .collect()
-}
-
-async fn autocomplete_user_action(_ctx: Context<'_>, partial: &str) -> Vec<String> {
-    vec!["authorize", "inthards", "sync", "latest_message"]
         .into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
         .map(|name| name.to_string())

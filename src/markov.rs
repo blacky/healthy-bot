@@ -6,6 +6,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// Matches Discord mentions (`<@id>`, `<@!id>`, `<@&id>`, `<#id>`). Compiled once
+/// and shared, since it's used on every stored message and every generation.
+static MENTION_REGEX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"<(@[!&]?|#)\d+>").unwrap());
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Markov {
@@ -135,6 +141,11 @@ impl MarkovRepository {
             return;
         }
 
+        // Tally this message's word pairs in memory first. This collapses any
+        // pair repeated within the message into a single row, and lets us write
+        // every pair in one transaction instead of one round-trip per pair.
+        // The map is scoped to this single message and dropped on return.
+        let mut pair_counts: HashMap<(&str, &str), i32> = HashMap::new();
         for (index, &word) in words.iter().enumerate() {
             if word.is_empty() {
                 continue;
@@ -156,20 +167,42 @@ impl MarkovRepository {
                 if w1.is_empty() || w2.is_empty() {
                     continue;
                 }
-
-                for id in [user_id, bot_id] {
-                    let _ = sqlx::query(
-                        "INSERT INTO markov_model (user_id, word1, word2, count) 
-                         VALUES (?, ?, ?, 1)
-                         ON CONFLICT(user_id, word1, word2) DO UPDATE SET count = count + 1",
-                    )
-                    .bind(id)
-                    .bind(w1)
-                    .bind(w2)
-                    .execute(&self.pool)
-                    .await;
-                }
+                *pair_counts.entry((w1, w2)).or_insert(0) += 1;
             }
+        }
+
+        if pair_counts.is_empty() {
+            return;
+        }
+
+        // Write everything in a single transaction: one commit / disk flush for
+        // the whole message instead of one per pair.
+        let mut tx = match self.pool.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("Failed to start Markov store transaction: {}", e);
+                return;
+            }
+        };
+
+        for id in [user_id, bot_id] {
+            for (&(w1, w2), &count) in &pair_counts {
+                let _ = sqlx::query(
+                    "INSERT INTO markov_model (user_id, word1, word2, count)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(user_id, word1, word2) DO UPDATE SET count = count + excluded.count",
+                )
+                .bind(id)
+                .bind(w1)
+                .bind(w2)
+                .bind(count)
+                .execute(&mut *tx)
+                .await;
+            }
+        }
+
+        if let Err(e) = tx.commit().await {
+            log::error!("Failed to commit Markov store transaction: {}", e);
         }
     }
 
@@ -180,8 +213,6 @@ impl MarkovRepository {
             return None;
         }
         phrase.push(word.clone());
-
-        let mention_regex = regex::Regex::new(r"<(@[!&]?|#)\d+>").unwrap();
 
         while !word.is_empty() && !word.ends_with(['.', '?', '!']) && word != "_end" {
             if let Some(next_word) = self.pick_next(user_id, &word).await {
@@ -200,7 +231,7 @@ impl MarkovRepository {
 
         let result = phrase
             .into_iter()
-            .filter(|w| !mention_regex.is_match(w) && w != "_end" && !w.is_empty())
+            .filter(|w| !MENTION_REGEX.is_match(w) && w != "_end" && !w.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -241,8 +272,7 @@ impl MarkovRepository {
     }
 
     fn format_content(&self, content: &str) -> String {
-        let re = regex::Regex::new(r"<(@[!&]?|#)\d+>").unwrap();
-        let cleaned = re.replace_all(content, "").trim().to_string();
+        let cleaned = MENTION_REGEX.replace_all(content, "").trim().to_string();
         if cleaned.is_empty() {
             return String::new();
         }

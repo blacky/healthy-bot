@@ -1,4 +1,5 @@
 use crate::db;
+use crate::truncate_str;
 use chrono::{Datelike, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
 use serenity::all::{ChannelId, ChannelType, GuildId, Http};
@@ -70,21 +71,37 @@ async fn announce_reminders(
     for reminder in &reminders {
         embed = embed.field(
             "",
-            format!("{} (<@{}>)", reminder.message, reminder.owner_discord_id),
+            truncate_str(
+                &format!("{} (<@{}>)", reminder.message, reminder.owner_discord_id),
+                1024,
+            ),
             false,
         );
     }
 
-    let _ = ChannelId::new(channel_id)
+    // Only delete the reminders once we've confirmed the announcement was sent.
+    // If the send fails (permissions, 5xx, embed limits, …), leave them in place
+    // so the next tick retries instead of silently dropping them.
+    match ChannelId::new(channel_id)
         .send_message(http, CreateMessage::new().embed(embed))
-        .await;
-
-    for reminder in reminders {
-        log::info!("Deleting processed reminder #{}", reminder.id);
-        sqlx::query("DELETE FROM reminder WHERE id = ?")
-            .bind(reminder.id)
-            .execute(pool)
-            .await?;
+        .await
+    {
+        Ok(_) => {
+            for reminder in reminders {
+                log::info!("Deleting processed reminder #{}", reminder.id);
+                sqlx::query("DELETE FROM reminder WHERE id = ?")
+                    .bind(reminder.id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to announce {} reminder(s); leaving them for the next tick: {:?}",
+                reminders.len(),
+                e
+            );
+        }
     }
 
     Ok(())
@@ -102,10 +119,16 @@ async fn update_reminders_vc(
     let guild_id: u64 = guild_id_str.parse()?;
 
     let now_ams = Utc::now().with_timezone(&Amsterdam);
-    let today_start = Amsterdam
+    let Some(today_start) = Amsterdam
         .with_ymd_and_hms(now_ams.year(), now_ams.month(), now_ams.day(), 0, 0, 0)
-        .unwrap()
-        .with_timezone(&Utc);
+        .earliest()
+    else {
+        // Local midnight doesn't exist (a DST spring-forward gap); skip this
+        // tick rather than panicking in the background task.
+        log::warn!("Could not resolve local midnight (DST gap); skipping VC update this tick.");
+        return Ok(());
+    };
+    let today_start = today_start.with_timezone(&Utc);
     let today_end = today_start + chrono::Duration::days(1);
 
     let all_reminders: Vec<db::Reminder> =
@@ -143,7 +166,8 @@ async fn update_reminders_vc(
                 .with_timezone(&Amsterdam)
                 .format("%H:%M")
                 .to_string();
-            format!("{} - {}", time_str, r.message)
+            // Discord caps channel names at 100 characters.
+            truncate_str(&format!("{} - {}", time_str, r.message), 100).into_owned()
         })
         .collect();
 
@@ -154,27 +178,56 @@ async fn update_reminders_vc(
     }
 
     log::info!(
-        "Updating VC reminders (found {} for today, changes detected)",
+        "Updating VC reminders (found {} for today, reconciling channels)",
         reminders.len()
     );
 
-    // Delete existing voice channels in the category
-    for channel in existing_vcs {
-        log::info!("Deleting old VC reminder: {}", channel.name);
-        let _ = channel.delete(http).await;
+    // Reconcile in place instead of deleting and recreating everything: channel
+    // create/delete are heavily rate-limited, so we only touch what changed.
+    let common = existing_vcs.len().min(desired_names.len());
+
+    // 1. Rename channels whose name no longer matches (one edit per changed slot).
+    for i in 0..common {
+        if existing_vcs[i].name != desired_names[i] {
+            log::info!(
+                "Renaming VC reminder '{}' -> '{}'",
+                existing_vcs[i].name,
+                desired_names[i]
+            );
+            if let Err(e) = existing_vcs[i]
+                .edit(
+                    http,
+                    serenity::all::EditChannel::new().name(&desired_names[i]),
+                )
+                .await
+            {
+                log::error!("Failed to rename VC reminder: {:?}", e);
+            }
+        }
     }
 
-    // Create new ones
-    for name in desired_names {
+    // 2. Delete any surplus channels (more exist than are needed today).
+    for channel in existing_vcs.iter().skip(desired_names.len()) {
+        log::info!("Deleting surplus VC reminder: {}", channel.name);
+        if let Err(e) = channel.delete(http).await {
+            log::error!("Failed to delete VC reminder: {:?}", e);
+        }
+    }
+
+    // 3. Create channels for any remaining desired names (fewer exist than needed).
+    for name in desired_names.iter().skip(existing_vcs.len()) {
         log::info!("Creating new VC reminder: {}", name);
-        let _ = guild
+        if let Err(e) = guild
             .create_channel(
                 http,
                 serenity::all::CreateChannel::new(name)
-                    .kind(serenity::all::ChannelType::Voice)
+                    .kind(ChannelType::Voice)
                     .category(ChannelId::new(category_id)),
             )
-            .await;
+            .await
+        {
+            log::error!("Failed to create VC reminder: {:?}", e);
+        }
     }
 
     Ok(())

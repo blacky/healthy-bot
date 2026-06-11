@@ -13,19 +13,8 @@ async fn setup_test_db() -> (SqlitePool, NamedTempFile) {
 
     let pool = SqlitePool::connect_with(options).await.unwrap();
 
-    // Initialize schema
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (discord_id TEXT PRIMARY KEY, authorized BOOLEAN, role TEXT, last_message INTEGER);"
-    ).execute(&pool).await.unwrap();
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS reminder (id INTEGER PRIMARY KEY, message TEXT, date INTEGER, owner_discord_id TEXT);"
-    ).execute(&pool).await.unwrap();
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS setting (k TEXT PRIMARY KEY, v TEXT);")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Use the production schema initializer so tests exercise the real schema.
+    db::init_schema(&pool).await.unwrap();
 
     (pool, temp_file)
 }
@@ -85,6 +74,43 @@ async fn test_db_settings() {
 
     let non_existent = db::get_setting(&pool, "none").await;
     assert_eq!(non_existent, None);
+}
+
+#[tokio::test]
+async fn test_init_schema_creates_core_tables_idempotently() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let db_path = temp_file.path().to_str().unwrap();
+    let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+
+    // Fresh database: running it twice must not error (idempotent).
+    db::init_schema(&pool).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+
+    // users table works.
+    db::create_user_if_not_exists(&pool, "42").await.unwrap();
+    assert!(db::get_user(&pool, "42").await.is_some());
+
+    // reminder table works, including the auto-increment id (the production
+    // INSERT omits id) that a missing schema previously broke.
+    sqlx::query("INSERT INTO reminder (message, date, owner_discord_id) VALUES ('hi', 1, '42')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM reminder WHERE owner_discord_id = '42'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(id > 0);
+
+    // setting table works.
+    sqlx::query("INSERT INTO setting (k, v) VALUES ('x', 'y')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(db::get_setting(&pool, "x").await, Some("y".to_string()));
 }
 
 #[test]
