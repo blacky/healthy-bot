@@ -14,19 +14,8 @@ async fn setup_test_db() -> (SqlitePool, NamedTempFile) {
 
     let pool = SqlitePool::connect_with(options).await.unwrap();
 
-    // Initialize schema
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (discord_id TEXT PRIMARY KEY, authorized BOOLEAN, role TEXT, last_message INTEGER);"
-    ).execute(&pool).await.unwrap();
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS reminder (id INTEGER PRIMARY KEY, message TEXT, date INTEGER, owner_discord_id TEXT);"
-    ).execute(&pool).await.unwrap();
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS setting (k TEXT PRIMARY KEY, v TEXT);")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Use the production schema initializer so tests exercise the real schema.
+    db::init_schema(&pool).await.unwrap();
 
     (pool, temp_file)
 }

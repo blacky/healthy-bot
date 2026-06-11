@@ -1,9 +1,10 @@
 use healthy_bot::markov::MarkovRepository;
-use healthy_bot::openai::{ChatMessage, OpenAIClient};
-use healthy_bot::{commands, db, tasks, Data, Error};
+use healthy_bot::openai::{sanitize_name, ChatMessage, OpenAIClient};
+use healthy_bot::{commands, db, tasks, Data, Error, UserError};
 use poise::serenity_prelude as serenity;
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -93,27 +94,39 @@ async fn event_handler(
             };
 
             let bot_name = ctx.cache.current_user().name.clone();
-            let mut messages = Vec::new();
-            let mut current_msg = new_message.clone();
             let bot_id = ctx.cache.current_user().id;
 
-            // Traverse up the reply chain (limit to 10 for safety/tokens)
+            // Build conversation context by walking up the reply chain. Discord
+            // only includes the immediate parent inline (`referenced_message`);
+            // deeper ancestors come back with an empty `referenced_message`, so
+            // each one must be fetched explicitly via its `message_reference`
+            // pointer. Capped at 10 hops for token/rate-limit safety.
+            let mut messages = Vec::new();
+            let mut parent = new_message.referenced_message.as_deref().cloned();
             for _ in 0..10 {
-                if let Some(ref_msg) = &current_msg.referenced_message {
-                    let role = if ref_msg.author.id == bot_id {
-                        "assistant"
-                    } else {
-                        "user"
-                    };
-                    messages.push(ChatMessage {
-                        role: role.to_string(),
-                        name: Some(ref_msg.author.name.clone()),
-                        content: ref_msg.content.clone(),
-                    });
-                    current_msg = *ref_msg.clone();
-                } else {
+                let Some(msg) = parent else {
                     break;
-                }
+                };
+
+                let role = if msg.author.id == bot_id {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                messages.push(ChatMessage {
+                    role: role.to_string(),
+                    name: Some(sanitize_name(&msg.author.name)),
+                    content: msg.content.clone(),
+                });
+
+                // Fetch this message's own parent (the gateway didn't include it).
+                parent = match &msg.message_reference {
+                    Some(reference) => match reference.message_id {
+                        Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
+                        None => None,
+                    },
+                    None => None,
+                };
             }
             messages.reverse(); // Reverse the history to be in chronological order
 
@@ -122,7 +135,7 @@ async fn event_handler(
                 0,
                 ChatMessage {
                     role: "developer".to_string(),
-                    name: Some(bot_name),
+                    name: Some(sanitize_name(&bot_name)),
                     content: bot_context,
                 },
             );
@@ -134,13 +147,12 @@ async fn event_handler(
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                name: Some(new_message.author.name.clone()),
+                name: Some(sanitize_name(&new_message.author.name)),
                 content: prompt.to_string(),
             });
 
-            let _ = new_message
-                .react(ctx, serenity::all::ReactionType::Unicode("💭".to_string()))
-                .await;
+            let thinking_reaction = serenity::all::ReactionType::Unicode("💭".to_string());
+            let _ = new_message.react(ctx, thinking_reaction.clone()).await;
             let _typing = new_message.channel_id.start_typing(&ctx.http);
 
             match data.openai_client.create_chat(&chat_model, messages).await {
@@ -149,12 +161,10 @@ async fn event_handler(
                         let content = &choice.message.content;
                         if content.is_empty() {
                             let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
-                            return Ok(());
-                        }
-
-                        // Discord 2000 char limit handling
-                        if content.len() <= 2000 {
+                        } else if content.len() <= 2000 {
+                            // Discord 2000 char limit handling
                             let _ = new_message.reply(ctx, content).await;
+                            log::info!("OpenAI replied to {}", new_message.author.name);
                         } else {
                             log::info!(
                                 "OpenAI response too long ({} chars), splitting...",
@@ -170,8 +180,8 @@ async fn event_handler(
                                 let _ = new_message.channel_id.say(ctx, chunk).await;
                                 start = end;
                             }
+                            log::info!("OpenAI replied to {}", new_message.author.name);
                         }
-                        log::info!("OpenAI replied to {}", new_message.author.name);
                     }
                 }
                 Err(e) => {
@@ -181,6 +191,12 @@ async fn event_handler(
                         .await;
                 }
             }
+
+            // Remove the "thinking" reaction now that we're done (success or error),
+            // so the bot never leaves a 💭 hanging on the message.
+            let _ = new_message
+                .delete_reaction(&ctx.http, None, thinking_reaction)
+                .await;
         }
     }
     Ok(())
@@ -229,9 +245,21 @@ async fn main() {
     let openai_key = std::env::var("OPENAI_SECRET").expect("missing OPENAI_SECRET");
 
     log::info!("Connecting to database: {}", db_url);
-    let pool = SqlitePool::connect(&format!("sqlite:{}", db_url))
+    let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_url))
+        .expect("Invalid DB_FILE path")
+        .create_if_missing(true)
+        // WAL lets readers and writers run concurrently; busy_timeout makes a
+        // contended writer wait-and-retry instead of instantly failing with
+        // "database is locked" on the write-heavy message hot path.
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePool::connect_with(connect_options)
         .await
         .expect("Failed to connect to database");
+
+    db::init_schema(&pool)
+        .await
+        .expect("Failed to initialize database schema");
 
     // Load initial settings cache
     let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT k, v FROM setting")
@@ -287,6 +315,7 @@ async fn main() {
                 commands::markov(),
                 commands::settings(),
                 commands::user_cmd(),
+                commands::inthards(),
                 commands::status(),
                 commands::help(),
                 commands::register(),
@@ -328,9 +357,18 @@ async fn main() {
                                 ctx.command().name,
                                 error
                             );
+                            // Only show the message to the user if it was raised as a
+                            // UserError; anything else (DB/parse/internal failures) is
+                            // logged above and replaced with a generic message so its
+                            // raw text never leaks into chat.
+                            let description = if error.downcast_ref::<UserError>().is_some() {
+                                error.to_string()
+                            } else {
+                                "Something went wrong while running that command.".to_string()
+                            };
                             let embed = serenity::builder::CreateEmbed::new()
                                 .title("Error")
-                                .description(error.to_string())
+                                .description(description)
                                 .color(0xFFFF00)
                                 .footer(serenity::builder::CreateEmbedFooter::new("Healthy Bot"));
                             let _ = ctx.send(poise::CreateReply::default().embed(embed)).await;
