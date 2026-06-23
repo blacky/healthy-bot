@@ -108,6 +108,19 @@ async fn event_handler(
                     break;
                 };
 
+                let content_trimmed = msg.content.trim();
+                if content_trimmed.is_empty() {
+                    // Fetch parent to keep traversing, but don't add empty message to vector
+                    parent = match &msg.message_reference {
+                        Some(reference) => match reference.message_id {
+                            Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    continue;
+                }
+
                 let role = if msg.author.id == bot_id {
                     "assistant"
                 } else {
@@ -116,7 +129,7 @@ async fn event_handler(
                 messages.push(ChatMessage {
                     role: role.to_string(),
                     name: Some(sanitize_name(&msg.author.name)),
-                    content: msg.content.clone(),
+                    content: content_trimmed.to_string(),
                 });
 
                 // Fetch this message's own parent (the gateway didn't include it).
@@ -130,11 +143,11 @@ async fn event_handler(
             }
             messages.reverse(); // Reverse the history to be in chronological order
 
-            // Add the developer prompt at the very beginning
+            // Add the system prompt at the very beginning
             messages.insert(
                 0,
                 ChatMessage {
-                    role: "developer".to_string(),
+                    role: "system".to_string(),
                     name: Some(sanitize_name(&bot_name)),
                     content: bot_context,
                 },
@@ -163,10 +176,10 @@ async fn event_handler(
                 log::info!("=== OpenAI Message Chain ===");
                 for (i, msg) in messages.iter().enumerate() {
                     log::info!(
-                        "  [{}] Role: {} | Name: {:?} | Content: {}",
+                        "  [{}] Role: {} | Name: {} | Content: {}",
                         i,
                         msg.role,
-                        msg.name,
+                        msg.name.as_deref().unwrap_or("-"),
                         msg.content
                     );
                 }

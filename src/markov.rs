@@ -50,19 +50,6 @@ impl MarkovRepository {
         )
         .execute(&self.pool)
         .await;
-
-        // Cleanup empty or whitespace words that might have been migrated from legacy
-        let res = sqlx::query(
-            "DELETE FROM markov_model WHERE word1 = '' OR word2 = '' OR word1 IS NULL OR word2 IS NULL OR TRIM(word1) = '' OR TRIM(word2) = ''"
-        )
-        .execute(&self.pool)
-        .await;
-
-        if let Ok(r) = res {
-            if r.rows_affected() > 0 {
-                log::info!("Cleaned up {} empty Markov entries.", r.rows_affected());
-            }
-        }
     }
 
     async fn migrate_legacy(&self, path: &str) {
@@ -125,6 +112,18 @@ impl MarkovRepository {
         if let Err(e) = tx.commit().await {
             log::error!("Failed to commit Markov migration transaction: {}", e);
         } else {
+            log::info!("Migration successful. Cleaning up empty or whitespace Markov entries...");
+            let res = sqlx::query(
+                "DELETE FROM markov_model WHERE word1 = '' OR word2 = '' OR TRIM(word1) = '' OR TRIM(word2) = ''"
+            )
+            .execute(&self.pool)
+            .await;
+
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    log::info!("Cleaned up {} empty Markov entries.", r.rows_affected());
+                }
+            }
             log::info!("Migration successful. Renaming legacy file.");
             let _ = std::fs::rename(path, format!("{}.migrated", path));
         }
