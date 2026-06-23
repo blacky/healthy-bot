@@ -223,8 +223,8 @@ pub async fn remind_cmd(
 
         reminders.sort_by_key(|r| r.date);
 
-        // Paginate: 20 reminders per page
-        let page_size = 20;
+        // Paginate: 10 reminders per page
+        let page_size = 10;
         let total_pages = (reminders.len() + page_size - 1) / page_size;
 
         if page > total_pages {
@@ -321,12 +321,12 @@ pub async fn remind_cmd(
                         }
                     }
                     "cancel" => {
+                        let (final_embed, _) = build_page_data(page, total_pages, &reminders, now_ams);
                         let _ = interaction.create_response(
                             ctx.http(),
                             serenity::CreateInteractionResponse::UpdateMessage(
                                 serenity::CreateInteractionResponseMessage::new()
-                                    .content("Pagination canceled.")
-                                    .embed(create_embed("Reminders").description("Canceled."))
+                                    .embed(final_embed)
                                     .components(vec![])
                             )
                         ).await;
