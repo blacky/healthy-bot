@@ -32,7 +32,7 @@ async fn test_db_create_and_get_user() {
     // Verify user exists
     let user = db::get_user(&pool, discord_id).await.unwrap();
     assert_eq!(user.discord_id, discord_id);
-    assert_eq!(user.authorized, false);
+    assert!(!user.authorized);
     assert_eq!(user.role, "USER");
 }
 

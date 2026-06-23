@@ -229,7 +229,7 @@ pub async fn remind_cmd(
 
         // Paginate: 10 reminders per page
         let page_size = 10;
-        let total_pages = (reminders.len() + page_size - 1) / page_size;
+        let total_pages = reminders.len().div_ceil(page_size);
 
         if page > total_pages {
             let mut embed = create_embed("Reminders").footer(CreateEmbedFooter::new(format!(
