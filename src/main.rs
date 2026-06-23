@@ -151,6 +151,28 @@ async fn event_handler(
                 content: prompt.to_string(),
             });
 
+            let ai_debug = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_debug")
+                    .map(|v| v.trim().to_lowercase() == "true")
+                    .unwrap_or(false)
+            };
+
+            if ai_debug {
+                log::info!("=== OpenAI Message Chain ===");
+                for (i, msg) in messages.iter().enumerate() {
+                    log::info!(
+                        "  [{}] Role: {} | Name: {:?} | Content: {}",
+                        i,
+                        msg.role,
+                        msg.name,
+                        msg.content
+                    );
+                }
+                log::info!("============================");
+            }
+
             let thinking_reaction = serenity::all::ReactionType::Unicode("💭".to_string());
             let _ = new_message.react(ctx, thinking_reaction.clone()).await;
             let _typing = new_message.channel_id.start_typing(&ctx.http);
