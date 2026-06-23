@@ -6,6 +6,7 @@ use chrono::{LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
 use poise::serenity_prelude as serenity;
 use serenity::builder::{CreateEmbed, CreateEmbedFooter};
+use poise::futures_util::StreamExt;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -158,12 +159,27 @@ pub async fn remind_cmd(
     }
 
     // Check for listing actions
-    let filter = parts
-        .iter()
-        .find(|&&p| ["today", "tomorrow", "week", "month"].contains(&p));
+    let mut page: usize = 1;
+    let mut filter = None;
+
+    for part in &parts {
+        if ["today", "tomorrow", "week", "month"].contains(part) {
+            filter = Some(*part);
+        } else if let Ok(p) = part.parse::<usize>() {
+            if p > 0 {
+                page = p;
+            }
+        }
+    }
 
     let invoked_name = ctx.invoked_command_name();
-    if input_val.is_empty() || filter.is_some() {
+    let is_listing = invoked_name == "reminders"
+        || invoked_name == "reminder"
+        || input_val.is_empty()
+        || filter.is_some()
+        || (parts.len() <= 2 && parts.first().map(|p| p.parse::<usize>().is_ok()).unwrap_or(false));
+
+    if is_listing {
         let mut reminders: Vec<db::Reminder> = if invoked_name == "reminders" {
             sqlx::query_as::<_, db::Reminder>("SELECT * FROM reminder")
                 .fetch_all(pool)
@@ -176,7 +192,7 @@ pub async fn remind_cmd(
         };
 
         let now_ams = Utc::now().with_timezone(&Amsterdam);
-        if let Some(&f) = filter {
+        if let Some(f) = filter {
             reminders.retain(|r| {
                 let r_date_ams = r.date_utc().with_timezone(&Amsterdam).date_naive();
                 match f {
@@ -195,26 +211,147 @@ pub async fn remind_cmd(
             });
         }
 
-        let mut embed = create_embed("Reminders").footer(CreateEmbedFooter::new(format!(
-            "Reminder example: !remind {} f1 time turds",
-            now_ams.format("%d-%m-%Y %H:%M")
-        )));
-
         if reminders.is_empty() {
+            let mut embed = create_embed("Reminders").footer(CreateEmbedFooter::new(format!(
+                "Reminder example: !remind {} f1 time turds",
+                now_ams.format("%d-%m-%Y %H:%M")
+            )));
             embed = embed.description("No reminders found.");
             ctx.send(poise::CreateReply::default().embed(embed)).await?;
             return Ok(());
         }
 
         reminders.sort_by_key(|r| r.date);
-        for r in reminders.iter().take(25) {
-            embed = embed.field(
-                truncate_str(&format!("#{}. {}", r.id, r.message.trim()), 256),
-                format!("<t:{}>", r.date_utc().timestamp()),
-                false,
-            );
+
+        // Paginate: 20 reminders per page
+        let page_size = 20;
+        let total_pages = (reminders.len() + page_size - 1) / page_size;
+
+        if page > total_pages {
+            let mut embed = create_embed("Reminders").footer(CreateEmbedFooter::new(format!(
+                "Reminder example: !remind {} f1 time turds",
+                now_ams.format("%d-%m-%Y %H:%M")
+            )));
+            embed = embed.description(format!(
+                "Page {} does not exist. Total pages: {}.",
+                page, total_pages
+            ));
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+            return Ok(());
         }
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+
+        let build_page_data = |page: usize, total_pages: usize, reminders: &[db::Reminder], now_ams: chrono::DateTime<chrono_tz::Tz>| {
+            let start_idx = (page - 1) * page_size;
+            let end_idx = std::cmp::min(start_idx + page_size, reminders.len());
+
+            let title = if total_pages > 1 {
+                format!("Reminders (Page {} of {})", page, total_pages)
+            } else {
+                "Reminders".to_string()
+            };
+
+            let mut embed = create_embed(&title).footer(CreateEmbedFooter::new(format!(
+                "Reminder example: !remind {} f1 time turds",
+                now_ams.format("%d-%m-%Y %H:%M")
+            )));
+
+            for r in &reminders[start_idx..end_idx] {
+                embed = embed.field(
+                    truncate_str(&format!("#{}. {}", r.id, r.message.trim()), 256),
+                    format!("<t:{}>", r.date_utc().timestamp()),
+                    false,
+                );
+            }
+
+            let components = if total_pages > 1 {
+                vec![serenity::CreateActionRow::Buttons(vec![
+                    serenity::CreateButton::new("prev_page")
+                        .label("◀")
+                        .style(serenity::ButtonStyle::Secondary)
+                        .disabled(page == 1),
+                    serenity::CreateButton::new("next_page")
+                        .label("▶")
+                        .style(serenity::ButtonStyle::Secondary)
+                        .disabled(page == total_pages),
+                    serenity::CreateButton::new("cancel")
+                        .label("❌")
+                        .style(serenity::ButtonStyle::Danger),
+                ])]
+            } else {
+                vec![]
+            };
+
+            (embed, components)
+        };
+
+        let (embed, components) = build_page_data(page, total_pages, &reminders, now_ams);
+        let reply = ctx.send(poise::CreateReply::default().embed(embed).components(components)).await?;
+
+        if total_pages > 1 {
+            let mut m = reply.into_message().await?;
+            let mut collector = serenity::collector::ComponentInteractionCollector::new(ctx)
+                .filter(move |int| int.message.id == m.id)
+                .timeout(std::time::Duration::from_secs(60))
+                .stream();
+
+            let mut canceled = false;
+            while let Some(interaction) = collector.next().await {
+                if interaction.user.id != ctx.author().id {
+                    let _ = interaction.create_response(
+                        ctx.http(),
+                        serenity::CreateInteractionResponse::Message(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .content("You cannot control this pagination.")
+                                .ephemeral(true)
+                        )
+                    ).await;
+                    continue;
+                }
+
+                let action = interaction.data.custom_id.as_str();
+                match action {
+                    "prev_page" => {
+                        if page > 1 {
+                            page -= 1;
+                        }
+                    }
+                    "next_page" => {
+                        if page < total_pages {
+                            page += 1;
+                        }
+                    }
+                    "cancel" => {
+                        let _ = interaction.create_response(
+                            ctx.http(),
+                            serenity::CreateInteractionResponse::UpdateMessage(
+                                serenity::CreateInteractionResponseMessage::new()
+                                    .content("Pagination canceled.")
+                                    .embed(create_embed("Reminders").description("Canceled."))
+                                    .components(vec![])
+                            )
+                        ).await;
+                        canceled = true;
+                        break;
+                    }
+                    _ => {}
+                }
+
+                let (new_embed, new_components) = build_page_data(page, total_pages, &reminders, now_ams);
+                let _ = interaction.create_response(
+                    ctx.http(),
+                    serenity::CreateInteractionResponse::UpdateMessage(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .embed(new_embed)
+                            .components(new_components)
+                    )
+                ).await;
+            }
+
+            if !canceled {
+                let _ = m.edit(ctx, serenity::EditMessage::new().components(vec![])).await;
+            }
+        }
+
         return Ok(());
     }
 
