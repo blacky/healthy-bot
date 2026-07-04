@@ -138,9 +138,13 @@ async fn event_handler(
                     "user"
                 };
 
-                let content_payload =
-                    build_message_content(ctx, content_trimmed, &msg.attachments, supports_vision)
-                        .await;
+                let content_payload = build_message_content(
+                    &data.openai_client.client,
+                    content_trimmed,
+                    &msg.attachments,
+                    supports_vision,
+                )
+                .await;
 
                 messages.push(ChatMessage {
                     role: role.to_string(),
@@ -174,8 +178,13 @@ async fn event_handler(
                 return Ok(());
             }
 
-            let prompt_payload =
-                build_message_content(ctx, prompt, &new_message.attachments, supports_vision).await;
+            let prompt_payload = build_message_content(
+                &data.openai_client.client,
+                prompt,
+                &new_message.attachments,
+                supports_vision,
+            )
+            .await;
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -558,12 +567,12 @@ async fn main() {
 }
 
 async fn build_message_content(
-    _ctx: &serenity::Context,
+    client: &reqwest::Client,
     text: &str,
     attachments: &[serenity::all::Attachment],
     supports_vision: bool,
 ) -> ChatMessageRequestContent {
-    if !supports_vision || attachments.is_empty() {
+    if !supports_vision {
         return ChatMessageRequestContent::Text(text.to_string());
     }
 
@@ -575,6 +584,8 @@ async fn build_message_content(
     }
 
     let mut image_count = 0;
+
+    // 1. Process attachments
     for attachment in attachments {
         if image_count >= 2 {
             break;
@@ -614,6 +625,61 @@ async fn build_message_content(
                         attachment.filename,
                         e
                     );
+                }
+            }
+        }
+    }
+
+    // 2. Process image URLs from text
+    if image_count < 2 {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let regex = RE.get_or_init(|| {
+            regex::Regex::new(r"(?i)https?://\S+?\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?").unwrap()
+        });
+
+        for mat in regex.find_iter(text) {
+            if image_count >= 2 {
+                break;
+            }
+
+            let url = mat.as_str();
+            match client.get(url).send().await {
+                Ok(resp) => {
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|val| val.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    let is_image = content_type
+                        .as_deref()
+                        .map(|ct| ct.starts_with("image/"))
+                        .unwrap_or(false);
+
+                    if is_image {
+                        match resp.bytes().await {
+                            Ok(bytes) => {
+                                use base64::{engine::general_purpose, Engine as _};
+                                let base64_data = general_purpose::STANDARD.encode(&bytes);
+                                let mime_type =
+                                    content_type.unwrap_or_else(|| "image/jpeg".to_string());
+                                let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+                                parts.push(ContentPart::ImageUrl {
+                                    image_url: ImageUrlTarget {
+                                        url: data_url,
+                                        detail: Some("low".to_string()),
+                                    },
+                                });
+                                image_count += 1;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to read bytes from image URL {}: {:?}", url, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch image URL {}: {:?}", url, e);
                 }
             }
         }
