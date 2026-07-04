@@ -26,30 +26,8 @@ pub struct MarkovRepository {
 impl MarkovRepository {
     pub async fn new(pool: SqlitePool, path: &str) -> Self {
         let repo = Self { pool };
-        repo.init().await;
         repo.migrate_legacy(path).await;
         repo
-    }
-
-    async fn init(&self) {
-        log::info!("Initializing Markov database tables...");
-        let _ = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS markov_model (
-                user_id TEXT NOT NULL,
-                word1 TEXT NOT NULL,
-                word2 TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (user_id, word1, word2)
-            );",
-        )
-        .execute(&self.pool)
-        .await;
-
-        let _ = sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_markov_model_user_word1 ON markov_model(user_id, word1);",
-        )
-        .execute(&self.pool)
-        .await;
     }
 
     async fn migrate_legacy(&self, path: &str) {

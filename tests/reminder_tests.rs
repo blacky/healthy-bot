@@ -14,8 +14,8 @@ async fn setup_test_db() -> (SqlitePool, NamedTempFile) {
 
     let pool = SqlitePool::connect_with(options).await.unwrap();
 
-    // Use the production schema initializer so tests exercise the real schema.
-    db::init_schema(&pool).await.unwrap();
+    // Use the production migrations so tests exercise the real schema.
+    sqlx::migrate!().run(&pool).await.unwrap();
 
     (pool, temp_file)
 }

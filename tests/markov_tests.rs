@@ -3,6 +3,10 @@ use sqlx::sqlite::SqlitePool;
 
 async fn setup_test_repo() -> MarkovRepository {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .unwrap();
     MarkovRepository::new(pool, "non_existent_path").await
 }
 

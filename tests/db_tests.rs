@@ -13,8 +13,8 @@ async fn setup_test_db() -> (SqlitePool, NamedTempFile) {
 
     let pool = SqlitePool::connect_with(options).await.unwrap();
 
-    // Use the production schema initializer so tests exercise the real schema.
-    db::init_schema(&pool).await.unwrap();
+    // Use the production migrations so tests exercise the real schema.
+    sqlx::migrate!().run(&pool).await.unwrap();
 
     (pool, temp_file)
 }
@@ -77,7 +77,7 @@ async fn test_db_settings() {
 }
 
 #[tokio::test]
-async fn test_init_schema_creates_core_tables_idempotently() {
+async fn test_migrations_run_idempotently() {
     let temp_file = NamedTempFile::new().unwrap();
     let db_path = temp_file.path().to_str().unwrap();
     let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
@@ -86,8 +86,8 @@ async fn test_init_schema_creates_core_tables_idempotently() {
     let pool = SqlitePool::connect_with(options).await.unwrap();
 
     // Fresh database: running it twice must not error (idempotent).
-    db::init_schema(&pool).await.unwrap();
-    db::init_schema(&pool).await.unwrap();
+    sqlx::migrate!().run(&pool).await.unwrap();
+    sqlx::migrate!().run(&pool).await.unwrap();
 
     // users table works.
     db::create_user_if_not_exists(&pool, "42").await.unwrap();

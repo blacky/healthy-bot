@@ -114,7 +114,7 @@ async fn event_handler(
             // pointer. Capped at 10 hops for token/rate-limit safety.
             let mut messages = Vec::new();
             let mut parent = new_message.referenced_message.as_deref().cloned();
-            for _ in 0..10 {
+            for hop in 0..10 {
                 let Some(msg) = parent else {
                     break;
                 };
@@ -138,11 +138,13 @@ async fn event_handler(
                     "user"
                 };
 
+                // Strip images from older ancestors (hop >= 1) to save tokens and costs; only keep for the immediate parent (hop == 0)
+                let include_images = supports_vision && hop == 0;
                 let content_payload = build_message_content(
                     &data.openai_client.client,
                     content_trimmed,
                     &msg.attachments,
-                    supports_vision,
+                    include_images,
                 )
                 .await;
 
@@ -326,9 +328,10 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
-    db::init_schema(&pool)
+    sqlx::migrate!()
+        .run(&pool)
         .await
-        .expect("Failed to initialize database schema");
+        .expect("Failed to run database migrations");
 
     // Load initial settings cache
     let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT k, v FROM setting")

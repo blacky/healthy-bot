@@ -30,47 +30,6 @@ impl Reminder {
     }
 }
 
-/// Create the core tables if they don't already exist.
-///
-/// This is a no-op against an existing (e.g. legacy-migrated) database, but it
-/// lets the bot start cleanly on a fresh database file instead of silently
-/// failing every query with "no such table". The `markov_model` table is
-/// created separately in [`crate::markov::MarkovRepository::init`].
-pub async fn init_schema(pool: &SqlitePool) -> sqlx::Result<()> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            discord_id TEXT PRIMARY KEY,
-            authorized BOOLEAN NOT NULL DEFAULT 0,
-            role TEXT NOT NULL DEFAULT 'USER',
-            last_message INTEGER
-        );",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS reminder (
-            id INTEGER PRIMARY KEY,
-            message TEXT NOT NULL,
-            date INTEGER NOT NULL,
-            owner_discord_id TEXT NOT NULL
-        );",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS setting (
-            k TEXT PRIMARY KEY,
-            v TEXT NOT NULL
-        );",
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 pub fn to_utc(ts: i64) -> DateTime<Utc> {
     if ts > 10_000_000_000 {
         // Assume milliseconds
