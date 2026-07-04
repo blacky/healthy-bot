@@ -456,6 +456,7 @@ pub async fn settings(
     key: Option<String>,
     #[rest]
     #[description = "New value"]
+    #[autocomplete = "autocomplete_settings_value"]
     value: Option<String>,
 ) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
@@ -468,6 +469,76 @@ pub async fn settings(
         }
         let key = key.ok_or_else(|| user_error("No key supplied"))?;
         let value = value.ok_or_else(|| user_error("No value supplied"))?;
+
+        // Setting validation dry-runs
+        match key.as_str() {
+            "main_text_channel" | "reminder_category" => {
+                let id_u64 = value.parse::<u64>().map_err(|_| {
+                    user_error(format!(
+                        "ID '{}' must be a valid numeric Discord ID.",
+                        value
+                    ))
+                })?;
+                let channel_id = serenity::all::ChannelId::new(id_u64);
+                if channel_id.to_channel(&ctx).await.is_err() {
+                    return Err(user_error(format!(
+                        "ID '{}' is invalid or not accessible by the bot.",
+                        value
+                    )));
+                }
+            }
+            "markov_cooldown_seconds" | "ai_cooldown_seconds" => {
+                let _ = value.parse::<u64>().map_err(|_| {
+                    user_error(format!(
+                        "Cooldown value '{}' must be a non-negative integer.",
+                        value
+                    ))
+                })?;
+            }
+            "ai_chat_model" => {
+                let val_lower = value.to_lowercase();
+                if !(val_lower.starts_with("gpt-")
+                    || val_lower.starts_with("o1-")
+                    || val_lower.starts_with("o3-")
+                    || val_lower.starts_with("claude-")
+                    || val_lower == "o1")
+                {
+                    return Err(user_error(format!(
+                        "Model '{}' is not recognized as a supported model name.",
+                        value
+                    )));
+                }
+            }
+            "reminder_pings" | "ai_debug" => {
+                let val_lower = value.to_lowercase();
+                if val_lower != "true" && val_lower != "false" {
+                    return Err(user_error(format!(
+                        "Value '{}' must be 'true' or 'false'.",
+                        value
+                    )));
+                }
+            }
+            "bot_status_type" => {
+                let val_lower = value.to_lowercase();
+                if !["playing", "watching", "listening", "competing", "custom"]
+                    .contains(&val_lower.as_str())
+                {
+                    return Err(user_error(format!(
+                        "Status type '{}' must be one of: playing, watching, listening, competing, custom.",
+                        value
+                    )));
+                }
+            }
+            "allowed_bot_id" => {
+                let _ = value.parse::<u64>().map_err(|_| {
+                    user_error(format!(
+                        "Bot ID '{}' must be a valid numeric user ID.",
+                        value
+                    ))
+                })?;
+            }
+            _ => {}
+        }
 
         sqlx::query("INSERT INTO setting (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = ?")
             .bind(&key)
@@ -482,7 +553,12 @@ pub async fn settings(
             cache.insert(key.clone(), value.clone());
         }
 
-        ctx.say(format!("Setting {} set to {}", key, value)).await?;
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("Setting {} set to {}", key, value))
+                .ephemeral(true),
+        )
+        .await?;
     } else {
         let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT * FROM setting")
             .fetch_all(pool)
@@ -492,7 +568,8 @@ pub async fn settings(
         for s in settings {
             embed = embed.field(truncate_str(&s.k, 256), truncate_str(&s.v, 1024), false);
         }
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+            .await?;
     }
     Ok(())
 }
@@ -837,5 +914,53 @@ async fn autocomplete_status(_ctx: Context<'_>, partial: &str) -> Vec<String> {
         .into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
         .map(|name| name.to_string())
+        .collect()
+}
+
+async fn autocomplete_settings_value(ctx: Context<'_>, partial: &str) -> Vec<String> {
+    let mut key = None;
+    if let poise::Context::Application(app_ctx) = ctx {
+        for option in &app_ctx.interaction.data.options {
+            // In slash subcommands, options might be nested under the subcommand
+            if option.name == "set" {
+                if let serenity::all::CommandDataOptionValue::SubCommand(sub_options) =
+                    &option.value
+                {
+                    for sub_opt in sub_options {
+                        if sub_opt.name == "key" {
+                            if let serenity::all::CommandDataOptionValue::String(val) =
+                                &sub_opt.value
+                            {
+                                key = Some(val.clone());
+                            }
+                        }
+                    }
+                }
+            } else if option.name == "key" {
+                if let serenity::all::CommandDataOptionValue::String(val) = &option.value {
+                    key = Some(val.clone());
+                }
+            }
+        }
+    }
+
+    let recommendations = match key.as_deref() {
+        Some("reminder_pings") | Some("ai_debug") => vec!["true", "false"],
+        Some("bot_status_type") => vec!["playing", "watching", "listening", "competing", "custom"],
+        Some("ai_chat_model") => vec![
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-5.1",
+            "o1",
+            "o1-mini",
+            "o3-mini",
+        ],
+        _ => vec![],
+    };
+
+    recommendations
+        .into_iter()
+        .filter(move |val| val.to_lowercase().starts_with(&partial.to_lowercase()))
+        .map(|val| val.to_string())
         .collect()
 }
