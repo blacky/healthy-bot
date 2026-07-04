@@ -1,5 +1,8 @@
 use healthy_bot::markov::MarkovRepository;
-use healthy_bot::openai::{sanitize_name, ChatMessage, OpenAIClient};
+use healthy_bot::openai::{
+    sanitize_name, ChatMessage, ChatMessageRequestContent, ContentPart, ImageUrlTarget,
+    OpenAIClient,
+};
 use healthy_bot::{commands, db, tasks, Data, Error, UserError};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
@@ -96,6 +99,14 @@ async fn event_handler(
             let bot_name = ctx.cache.current_user().name.clone();
             let bot_id = ctx.cache.current_user().id;
 
+            let supports_vision = {
+                let model_lower = chat_model.to_lowercase();
+                model_lower.contains("gpt-4o")
+                    || model_lower.contains("gpt-5")
+                    || model_lower.contains("o1")
+                    || model_lower.contains("o3")
+            };
+
             // Build conversation context by walking up the reply chain. Discord
             // only includes the immediate parent inline (`referenced_message`);
             // deeper ancestors come back with an empty `referenced_message`, so
@@ -109,7 +120,7 @@ async fn event_handler(
                 };
 
                 let content_trimmed = msg.content.trim();
-                if content_trimmed.is_empty() {
+                if content_trimmed.is_empty() && msg.attachments.is_empty() {
                     // Fetch parent to keep traversing, but don't add empty message to vector
                     parent = match &msg.message_reference {
                         Some(reference) => match reference.message_id {
@@ -126,10 +137,15 @@ async fn event_handler(
                 } else {
                     "user"
                 };
+
+                let content_payload =
+                    build_message_content(ctx, content_trimmed, &msg.attachments, supports_vision)
+                        .await;
+
                 messages.push(ChatMessage {
                     role: role.to_string(),
                     name: Some(sanitize_name(&msg.author.name)),
-                    content: content_trimmed.to_string(),
+                    content: content_payload,
                 });
 
                 // Fetch this message's own parent (the gateway didn't include it).
@@ -149,19 +165,22 @@ async fn event_handler(
                 ChatMessage {
                     role: "system".to_string(),
                     name: Some(sanitize_name(&bot_name)),
-                    content: bot_context,
+                    content: ChatMessageRequestContent::Text(bot_context),
                 },
             );
 
             let prompt = new_message.content.trim();
-            if prompt.is_empty() {
+            if prompt.is_empty() && new_message.attachments.is_empty() {
                 return Ok(());
             }
+
+            let prompt_payload =
+                build_message_content(ctx, prompt, &new_message.attachments, supports_vision).await;
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 name: Some(sanitize_name(&new_message.author.name)),
-                content: prompt.to_string(),
+                content: prompt_payload,
             });
 
             let ai_debug = {
@@ -205,6 +224,7 @@ async fn event_handler(
                                 "OpenAI response too long ({} chars), splitting...",
                                 content.len()
                             );
+                            let mut last_sent: Option<serenity::Message> = None;
                             let mut start = 0;
                             while start < content.len() {
                                 let mut end = std::cmp::min(start + 2000, content.len());
@@ -212,7 +232,12 @@ async fn event_handler(
                                     end -= 1;
                                 }
                                 let chunk = &content[start..end];
-                                let _ = new_message.channel_id.say(ctx, chunk).await;
+                                let sent = if let Some(ref prev) = last_sent {
+                                    prev.reply(ctx, chunk).await.ok()
+                                } else {
+                                    new_message.reply(ctx, chunk).await.ok()
+                                };
+                                last_sent = sent;
                                 start = end;
                             }
                             log::info!("OpenAI replied to {}", new_message.author.name);
@@ -529,5 +554,75 @@ async fn main() {
     log::info!("Starting client...");
     if let Err(why) = client.start().await {
         log::error!("Client error: {:?}", why);
+    }
+}
+
+async fn build_message_content(
+    _ctx: &serenity::Context,
+    text: &str,
+    attachments: &[serenity::all::Attachment],
+    supports_vision: bool,
+) -> ChatMessageRequestContent {
+    if !supports_vision || attachments.is_empty() {
+        return ChatMessageRequestContent::Text(text.to_string());
+    }
+
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(ContentPart::Text {
+            text: text.to_string(),
+        });
+    }
+
+    let mut image_count = 0;
+    for attachment in attachments {
+        if image_count >= 2 {
+            break;
+        }
+
+        let is_image = attachment
+            .content_type
+            .as_deref()
+            .map(|ct| ct.starts_with("image/"))
+            .unwrap_or_else(|| {
+                let name = attachment.filename.to_lowercase();
+                name.ends_with(".png")
+                    || name.ends_with(".jpg")
+                    || name.ends_with(".jpeg")
+                    || name.ends_with(".webp")
+                    || name.ends_with(".gif")
+            });
+
+        if is_image {
+            match attachment.download().await {
+                Ok(bytes) => {
+                    use base64::{engine::general_purpose, Engine as _};
+                    let base64_data = general_purpose::STANDARD.encode(&bytes);
+                    let mime_type = attachment.content_type.as_deref().unwrap_or("image/jpeg");
+                    let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+                    parts.push(ContentPart::ImageUrl {
+                        image_url: ImageUrlTarget {
+                            url: data_url,
+                            detail: Some("low".to_string()),
+                        },
+                    });
+                    image_count += 1;
+                }
+                Err(e) => {
+                    log::error!("Failed to download attachment {}: {:?}", attachment.filename, e);
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        ChatMessageRequestContent::Text(text.to_string())
+    } else if parts.len() == 1 {
+        match parts.remove(0) {
+            ContentPart::Text { text } => ChatMessageRequestContent::Text(text),
+            other => ChatMessageRequestContent::Parts(vec![other]),
+        }
+    } else {
+        ChatMessageRequestContent::Parts(parts)
     }
 }

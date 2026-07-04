@@ -816,6 +816,7 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "bot_status_message",
         "allowed_bot_id",
         "ai_debug",
+        "reminder_pings",
     ];
     keys.into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))

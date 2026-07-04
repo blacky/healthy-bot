@@ -27,11 +27,57 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatMessageRequestContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl std::fmt::Display for ChatMessageRequestContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(s) => f.write_str(s),
+            Self::Parts(parts) => {
+                let mut first = true;
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        if !first {
+                            f.write_str(" ")?;
+                        }
+                        f.write_str(text)?;
+                        first = false;
+                    }
+                }
+                if first {
+                    f.write_str("[Image/Media]")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlTarget },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrlTarget {
+    pub url: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub name: Option<String>,
-    pub content: String,
+    pub content: ChatMessageRequestContent,
 }
 
 #[derive(Debug, Serialize)]

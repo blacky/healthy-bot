@@ -68,24 +68,29 @@ async fn announce_reminders(
     let channel_id: u64 = channel_id_str.parse()?;
 
     let mut embed = create_embed("Reminders");
+    let mut pings = Vec::new();
     for reminder in &reminders {
-        embed = embed.field(
-            "",
-            truncate_str(
-                &format!("{} (<@{}>)", reminder.message, reminder.owner_discord_id),
-                1024,
-            ),
-            false,
-        );
+        embed = embed.field("", truncate_str(&reminder.message, 1024), false);
+        let ping = format!("<@{}>", reminder.owner_discord_id);
+        if !pings.contains(&ping) {
+            pings.push(ping);
+        }
+    }
+
+    let reminder_pings = db::get_setting(pool, "reminder_pings")
+        .await
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let mut message = CreateMessage::new().embed(embed);
+    if reminder_pings && !pings.is_empty() {
+        message = message.content(pings.join(" "));
     }
 
     // Only delete the reminders once we've confirmed the announcement was sent.
     // If the send fails (permissions, 5xx, embed limits, …), leave them in place
     // so the next tick retries instead of silently dropping them.
-    match ChannelId::new(channel_id)
-        .send_message(http, CreateMessage::new().embed(embed))
-        .await
-    {
+    match ChannelId::new(channel_id).send_message(http, message).await {
         Ok(_) => {
             for reminder in reminders {
                 log::info!("Deleting processed reminder #{}", reminder.id);
