@@ -609,7 +609,11 @@ async fn build_message_content(
                     image_count += 1;
                 }
                 Err(e) => {
-                    log::error!("Failed to download attachment {}: {:?}", attachment.filename, e);
+                    log::error!(
+                        "Failed to download attachment {}: {:?}",
+                        attachment.filename,
+                        e
+                    );
                 }
             }
         }
