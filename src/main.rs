@@ -1,10 +1,12 @@
-use healthy_bot::chime::{self, ChimeEntry};
+use healthy_bot::chime;
 use healthy_bot::markov::MarkovRepository;
 use healthy_bot::openai::{
     sanitize_name, ChatMessage, ChatMessageRequestContent, ContentPart, ImageUrlTarget,
     OpenAIClient,
 };
-use healthy_bot::{commands, db, split_message, tasks, truncate_str, Data, Error, UserError};
+use healthy_bot::{
+    commands, db, recent, split_message, tasks, truncate_str, Data, Error, UserError,
+};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use std::collections::HashMap;
@@ -364,6 +366,11 @@ async fn main() {
         last_random_chime: tokio::sync::Mutex::new(
             std::time::Instant::now() - std::time::Duration::from_secs(3600),
         ),
+        chime_tally: tokio::sync::Mutex::new(chime::ChimeTally::new(
+            chrono::Utc::now()
+                .with_timezone(&chrono_tz::Europe::Amsterdam)
+                .date_naive(),
+        )),
         settings_cache: settings_cache.clone(),
     };
 
@@ -575,67 +582,109 @@ async fn main() {
     }
 }
 
+/// System prompt for the relevance pre-check — a cheap yes/no gate that runs
+/// after the probability roll but before generating a full interjection.
+const RELEVANCE_SYSTEM_PROMPT: &str =
+    "You decide whether a chat bot should spontaneously chime into an ongoing \
+     conversation. Given the recent messages, answer with only 'YES' if a short \
+     interjection would be welcome and add value, or 'NO' otherwise. Prefer NO \
+     when the conversation is private, sensitive, heated, or would not benefit \
+     from a bot interjecting.";
+
 /// Occasionally join a conversation on the bot's own initiative.
 ///
 /// Called for human messages in which the bot was *not* mentioned or replied to.
-/// It only acts when the feature is enabled (`random_chime_chance` > 0), the
-/// message is in the configured main channel and passes the eligibility checks,
-/// a per-channel cooldown has elapsed, and a probability roll succeeds. On
-/// success it feeds the recent conversation to OpenAI and posts a standalone
-/// message. All failures are logged and swallowed — a chime is best-effort.
+/// The pure gate chain ([`chime::evaluate`]) decides whether to act based on the
+/// enable flag, eligibility, a daily cap, a cooldown, and a probability roll.
+/// When it fires, an optional relevance pre-check asks a cheap model whether an
+/// interjection is actually warranted (failing closed) before the recent
+/// conversation is fed to OpenAI and a standalone message is posted. All
+/// failures are logged and swallowed — a chime is best-effort.
 async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &serenity::Message) {
-    let (chance, cooldown_secs, main_channel, prefix, base_prompt, chat_model) = {
+    let (settings, main_channel, prefix, base_prompt, chat_model, relevance_check) = {
         let cache = data.settings_cache.read().await;
-        (
-            cache
+        let settings = chime::ChimeSettings {
+            chance: cache
                 .get("random_chime_chance")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0),
-            cache
+            cooldown_secs: cache
                 .get("random_chime_cooldown_seconds")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(600),
+            daily_cap: cache
+                .get("random_chime_daily_cap")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
+        };
+        // A dedicated chime persona/model falls back to the shared AI settings.
+        let base_prompt = cache
+            .get("random_chime_prompt")
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| cache.get("ai_initial_prompt"))
+            .cloned()
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        let chat_model = cache
+            .get("random_chime_model")
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| cache.get("ai_chat_model"))
+            .cloned()
+            .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+        let relevance_check = cache
+            .get("random_chime_relevance_check")
+            .map(|v| v.trim().to_lowercase() != "false")
+            .unwrap_or(true);
+        (
+            settings,
             cache.get("main_text_channel").cloned(),
             cache
                 .get("command_prefix")
                 .cloned()
                 .unwrap_or_else(|| "!".to_string()),
-            cache
-                .get("ai_initial_prompt")
-                .cloned()
-                .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
-            cache
-                .get("ai_chat_model")
-                .cloned()
-                .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+            base_prompt,
+            chat_model,
+            relevance_check,
         )
     };
 
-    if chance <= 0.0 {
-        return;
-    }
-
     let in_main_channel =
         main_channel.as_deref() == Some(new_message.channel_id.to_string().as_str());
-    // `mentioned`/`replied` are already false here (checked by the caller).
-    if !chime::is_chime_eligible(&new_message.content, &prefix, in_main_channel, false, false) {
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Amsterdam)
+        .date_naive();
+
+    // Evaluate the gate chain under the state locks. A fire consumes the cooldown
+    // and records the daily-cap tally *now* — before the relevance check and the
+    // reply — so both extra API calls stay bounded to ~one per cooldown window,
+    // even when relevance often declines. `mentioned`/`replied` are already false
+    // here (checked by the caller).
+    let fire = {
+        let mut last = data.last_random_chime.lock().await;
+        let mut tally = data.chime_tally.lock().await;
+        let inputs = chime::ChimeInputs {
+            content: &new_message.content,
+            prefix: &prefix,
+            in_main_channel,
+            mentioned: false,
+            replied: false,
+            elapsed_since_last: last.elapsed(),
+            chimes_today: tally.count_for(today),
+            roll: rand::random::<f64>(),
+        };
+        match chime::evaluate(&settings, &inputs) {
+            chime::ChimeDecision::Fire => {
+                *last = std::time::Instant::now();
+                tally.record(today);
+                true
+            }
+            chime::ChimeDecision::Skip(_) => false,
+        }
+    };
+    if !fire {
         return;
     }
 
-    // Cooldown gates the time between *actual* chimes: only a successful roll
-    // resets the timer, so failed rolls don't start the cooldown.
-    {
-        let mut last = data.last_random_chime.lock().await;
-        if last.elapsed().as_secs() < cooldown_secs {
-            return;
-        }
-        if !chime::should_fire(chance, rand::random::<f64>()) {
-            return;
-        }
-        *last = std::time::Instant::now();
-    }
-
-    let recent = match new_message
+    let recent_messages = match new_message
         .channel_id
         .messages(&ctx.http, serenity::builder::GetMessages::new().limit(10))
         .await
@@ -648,14 +697,49 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
     };
 
     let bot_id = ctx.cache.current_user().id;
-    let entries: Vec<ChimeEntry> = recent
+    let entries: Vec<recent::RecentMessage> = recent_messages
         .iter()
-        .map(|m| ChimeEntry {
+        .map(|m| recent::RecentMessage {
             author_name: m.author.name.clone(),
             content: m.content_safe(&ctx.cache),
             is_bot: m.author.id == bot_id,
         })
         .collect();
+
+    // Relevance pre-check: a cheap yes/no on whether an interjection is warranted.
+    // Fails closed — an error, an empty transcript, or a "no" keeps the bot quiet.
+    if relevance_check {
+        let Some(transcript) = recent::build_transcript(&entries) else {
+            return;
+        };
+        let judge = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                name: None,
+                content: ChatMessageRequestContent::Text(RELEVANCE_SYSTEM_PROMPT.to_string()),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: ChatMessageRequestContent::Text(transcript),
+            },
+        ];
+        let welcome = match data.openai_client.create_chat(&chat_model, judge).await {
+            Ok(resp) => resp
+                .choices
+                .first()
+                .map(|c| chime::is_affirmative(&c.message.content))
+                .unwrap_or(false),
+            Err(e) => {
+                log::error!("Random chime: relevance check failed: {:?}", e);
+                false
+            }
+        };
+        if !welcome {
+            log::info!("Random chime: relevance check declined; staying quiet.");
+            return;
+        }
+    }
 
     let system_prompt = format!(
         "{}\n\nYou are spontaneously joining an ongoing conversation in a chat channel. \
@@ -663,7 +747,7 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
          Do not introduce yourself or explain that you are a bot.",
         base_prompt
     );
-    let messages = chime::build_chime_messages(&system_prompt, &entries);
+    let messages = recent::build_chat_messages(&system_prompt, &entries);
 
     log::info!(
         "Random chime triggered in channel {}",

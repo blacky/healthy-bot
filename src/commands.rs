@@ -1,5 +1,6 @@
 use crate::db;
 use crate::openai::{ChatMessage, ChatMessageRequestContent};
+use crate::recent;
 use crate::split_message;
 use crate::truncate_str;
 use crate::user_error;
@@ -446,35 +447,6 @@ pub async fn markov(ctx: Context<'_>, user: Option<serenity::User>) -> Result<()
     Ok(())
 }
 
-/// A channel message reduced to what the summarizer needs. Decoupled from
-/// serenity's `Message` so [`build_transcript`] can be unit-tested without
-/// constructing Discord types.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptEntry {
-    pub name: String,
-    pub content: String,
-    pub is_bot: bool,
-}
-
-/// Turn channel messages — as Discord returns them, newest-first — into a plain
-/// chronological transcript (`Name: message` per line) for summarization. Bot
-/// messages and entries that are blank after trimming are dropped. Returns
-/// `None` when nothing summarizable remains.
-pub fn build_transcript(messages: &[TranscriptEntry]) -> Option<String> {
-    let lines: Vec<String> = messages
-        .iter()
-        .rev() // Discord returns newest-first; a transcript should read oldest-first.
-        .filter(|m| !m.is_bot && !m.content.trim().is_empty())
-        .map(|m| format!("{}: {}", m.name, m.content.trim()))
-        .collect();
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
 /// Summarize the recent conversation in the current channel
 #[poise::command(slash_command, prefix_command)]
 pub async fn tldr(
@@ -510,17 +482,17 @@ pub async fn tldr(
         )
         .await?;
 
-    let entries: Vec<TranscriptEntry> = messages
+    let entries: Vec<recent::RecentMessage> = messages
         .iter()
-        .map(|m| TranscriptEntry {
-            name: m.author.name.clone(),
+        .map(|m| recent::RecentMessage {
+            author_name: m.author.name.clone(),
             // content_safe renders mentions as names instead of raw <@id> tokens.
             content: m.content_safe(ctx.cache()),
             is_bot: m.author.bot,
         })
         .collect();
 
-    let transcript = build_transcript(&entries)
+    let transcript = recent::build_transcript(&entries)
         .ok_or_else(|| user_error("There's nothing recent to summarize here."))?;
 
     let chat_model = {
@@ -645,7 +617,15 @@ pub async fn settings(
                     )));
                 }
             }
-            "ai_chat_model" => {
+            "random_chime_daily_cap" => {
+                let _ = value.parse::<u32>().map_err(|_| {
+                    user_error(format!(
+                        "Daily cap '{}' must be a non-negative integer (0 = unlimited).",
+                        value
+                    ))
+                })?;
+            }
+            "ai_chat_model" | "random_chime_model" => {
                 let val_lower = value.to_lowercase();
                 if !(val_lower.starts_with("gpt-")
                     || val_lower.starts_with("o1-")
@@ -659,7 +639,7 @@ pub async fn settings(
                     )));
                 }
             }
-            "reminder_pings" | "ai_debug" => {
+            "reminder_pings" | "ai_debug" | "random_chime_relevance_check" => {
                 let val_lower = value.to_lowercase();
                 if val_lower != "true" && val_lower != "false" {
                     return Err(user_error(format!(
@@ -1047,6 +1027,10 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "reminder_pings",
         "random_chime_chance",
         "random_chime_cooldown_seconds",
+        "random_chime_daily_cap",
+        "random_chime_prompt",
+        "random_chime_model",
+        "random_chime_relevance_check",
     ];
     keys.into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))

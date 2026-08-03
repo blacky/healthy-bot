@@ -1,11 +1,34 @@
-use healthy_bot::chime::{build_chime_messages, is_chime_eligible, should_fire, ChimeEntry};
+use chrono::NaiveDate;
+use healthy_bot::chime::{
+    evaluate, is_affirmative, is_chime_eligible, should_fire, ChimeDecision, ChimeInputs,
+    ChimeSettings, ChimeTally, SkipReason,
+};
+use std::time::Duration;
 
-fn entry(name: &str, content: &str, is_bot: bool) -> ChimeEntry {
-    ChimeEntry {
-        author_name: name.to_string(),
-        content: content.to_string(),
-        is_bot,
+fn settings(chance: f64, cooldown_secs: u64, daily_cap: u32) -> ChimeSettings {
+    ChimeSettings {
+        chance,
+        cooldown_secs,
+        daily_cap,
     }
+}
+
+/// Inputs that pass every gate, so individual tests can perturb one field.
+fn passing_inputs() -> ChimeInputs<'static> {
+    ChimeInputs {
+        content: "hey what's up",
+        prefix: "!",
+        in_main_channel: true,
+        mentioned: false,
+        replied: false,
+        elapsed_since_last: Duration::from_secs(10_000),
+        chimes_today: 0,
+        roll: 0.0, // always under any positive chance
+    }
+}
+
+fn day() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 8, 3).unwrap()
 }
 
 #[test]
@@ -54,28 +77,89 @@ fn should_fire_respects_bounds() {
 }
 
 #[test]
-fn build_messages_orders_chronologically_and_maps_roles() {
-    // Discord returns newest-first; the prompt must read oldest-first.
-    let recent = vec![
-        entry("Bob", "third", false),
-        entry("HealthyBot", "second", true),
-        entry("Alice", "first", false),
-    ];
-    let msgs = build_chime_messages("SYS", &recent);
-    assert_eq!(msgs.len(), 4);
-    assert_eq!(msgs[0].role, "system");
-    assert_eq!(msgs[0].content.to_string(), "SYS");
-    assert_eq!(msgs[1].role, "user"); // Alice, oldest
-    assert_eq!(msgs[1].content.to_string(), "first");
-    assert_eq!(msgs[2].role, "assistant"); // the bot's own message
-    assert_eq!(msgs[3].role, "user"); // Bob, newest
-    assert_eq!(msgs[3].content.to_string(), "third");
+fn evaluate_fires_when_all_gates_pass() {
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 0), &passing_inputs()),
+        ChimeDecision::Fire
+    );
 }
 
 #[test]
-fn build_messages_skips_blank_entries() {
-    let recent = vec![entry("Alice", "   ", false), entry("Bob", "hi", false)];
-    let msgs = build_chime_messages("SYS", &recent);
-    assert_eq!(msgs.len(), 2); // system + Bob only
-    assert_eq!(msgs[1].content.to_string(), "hi");
+fn evaluate_skips_when_disabled() {
+    assert_eq!(
+        evaluate(&settings(0.0, 600, 0), &passing_inputs()),
+        ChimeDecision::Skip(SkipReason::Disabled)
+    );
+}
+
+#[test]
+fn evaluate_skips_when_ineligible() {
+    let mut inputs = passing_inputs();
+    inputs.in_main_channel = false;
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 0), &inputs),
+        ChimeDecision::Skip(SkipReason::Ineligible)
+    );
+}
+
+#[test]
+fn evaluate_skips_when_daily_cap_reached() {
+    let mut inputs = passing_inputs();
+    inputs.chimes_today = 3;
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 3), &inputs),
+        ChimeDecision::Skip(SkipReason::DailyCapReached)
+    );
+    // A cap of 0 means unlimited, so the same count fires.
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 0), &inputs),
+        ChimeDecision::Fire
+    );
+}
+
+#[test]
+fn evaluate_skips_when_on_cooldown() {
+    let mut inputs = passing_inputs();
+    inputs.elapsed_since_last = Duration::from_secs(30);
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 0), &inputs),
+        ChimeDecision::Skip(SkipReason::OnCooldown)
+    );
+}
+
+#[test]
+fn evaluate_skips_when_roll_misses() {
+    let mut inputs = passing_inputs();
+    inputs.roll = 0.99; // above a 5% threshold
+    assert_eq!(
+        evaluate(&settings(5.0, 600, 0), &inputs),
+        ChimeDecision::Skip(SkipReason::RollMissed)
+    );
+}
+
+#[test]
+fn tally_counts_and_rolls_over_by_day() {
+    let mut tally = ChimeTally::new(day());
+    assert_eq!(tally.count_for(day()), 0);
+    tally.record(day());
+    tally.record(day());
+    assert_eq!(tally.count_for(day()), 2);
+
+    // A new day resets the count.
+    let next = day().succ_opt().unwrap();
+    assert_eq!(tally.count_for(next), 0);
+    tally.record(next);
+    assert_eq!(tally.count_for(next), 1);
+}
+
+#[test]
+fn is_affirmative_recognizes_yes() {
+    assert!(is_affirmative("YES"));
+    assert!(is_affirmative("yes, definitely"));
+    assert!(is_affirmative("  Yes."));
+    assert!(is_affirmative("\"YES\""));
+    assert!(!is_affirmative("NO"));
+    assert!(!is_affirmative("no thanks"));
+    assert!(!is_affirmative("")); // empty → not affirmative (fail closed)
+    assert!(!is_affirmative("maybe"));
 }

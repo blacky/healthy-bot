@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod markov;
 pub mod openai;
+pub mod recent;
 pub mod tasks;
 
 use crate::markov::MarkovRepository;
@@ -21,6 +22,7 @@ pub struct Data {
     pub last_openai: tokio::sync::Mutex<std::time::Instant>,
     pub last_tldr: tokio::sync::Mutex<std::time::Instant>,
     pub last_random_chime: tokio::sync::Mutex<std::time::Instant>,
+    pub chime_tally: tokio::sync::Mutex<crate::chime::ChimeTally>,
     pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
