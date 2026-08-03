@@ -313,11 +313,28 @@ pub async fn remind_cmd(
                 .timeout(std::time::Duration::from_secs(60))
                 .stream();
 
+            let mut cancelled = false;
             while let Some(interaction) = collector.next().await {
+                if interaction.data.custom_id == "cancel" {
+                    cancelled = true;
+                    let (current_embed, _) =
+                        build_page_data(page, total_pages, &reminders, now_ams);
+                    interaction
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::UpdateMessage(
+                                serenity::CreateInteractionResponseMessage::new()
+                                    .embed(current_embed)
+                                    .components(vec![]),
+                            ),
+                        )
+                        .await?;
+                    break;
+                }
+
                 match interaction.data.custom_id.as_str() {
                     "prev_page" => page = page.saturating_sub(1),
                     "next_page" => page = std::cmp::min(page + 1, total_pages),
-                    "cancel" => break,
                     _ => continue,
                 }
 
@@ -334,9 +351,18 @@ pub async fn remind_cmd(
                     )
                     .await?;
             }
-            reply
-                .edit(ctx, poise::CreateReply::default().components(vec![]))
-                .await?;
+
+            if !cancelled {
+                let (final_embed, _) = build_page_data(page, total_pages, &reminders, now_ams);
+                let _ = reply
+                    .edit(
+                        ctx,
+                        poise::CreateReply::default()
+                            .embed(final_embed)
+                            .components(vec![]),
+                    )
+                    .await;
+            }
         }
 
         return Ok(());
@@ -650,25 +676,84 @@ pub async fn settings(
         )
         .await?;
     } else {
-        let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT * FROM setting")
-            .bind(key.as_deref())
-            .fetch_all(pool)
-            .await?;
+        let filter_key = match (action.as_deref(), key.as_deref()) {
+            (Some("set"), _) => None,
+            (Some("get"), k) => k,
+            (Some(act), _) if act != "get" && act != "set" => Some(act),
+            (_, k) => k,
+        };
 
-        if settings.is_empty() {
-            let embed = create_embed("HealthyBot Settings").description("No settings found.");
+        let db_settings: Vec<db::Setting> =
+            sqlx::query_as::<_, db::Setting>("SELECT * FROM setting")
+                .fetch_all(pool)
+                .await?;
+        let db_map: std::collections::HashMap<String, String> =
+            db_settings.into_iter().map(|s| (s.k, s.v)).collect();
+
+        let known_defaults: &[(&str, &str)] = &[
+            ("command_prefix", "!"),
+            ("main_text_channel", "(not set)"),
+            ("reminder_category", "(not set)"),
+            ("markov_cooldown_seconds", "60"),
+            ("ai_cooldown_seconds", "60"),
+            ("tldr_cooldown_seconds", "60"),
+            ("ai_initial_prompt", "(default system prompt)"),
+            ("ai_chat_model", "gpt-4o"),
+            ("bot_status_type", "playing"),
+            ("bot_status_message", "(not set)"),
+            ("allowed_bot_id", "(not set)"),
+            ("ai_debug", "false"),
+            ("reminder_pings", "true"),
+            ("random_chime_chance", "0"),
+            ("random_chime_cooldown_seconds", "1800"),
+            ("random_chime_daily_cap", "3"),
+            ("random_chime_prompt", "(fallback to ai_initial_prompt)"),
+            ("random_chime_model", "(fallback to ai_chat_model)"),
+            ("random_chime_relevance_check", "true"),
+        ];
+
+        let mut settings_list: Vec<(String, String)> = Vec::new();
+        let mut processed_keys = std::collections::HashSet::new();
+
+        for &(k, default_v) in known_defaults {
+            let v = db_map
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| default_v.to_string());
+            settings_list.push((k.to_string(), v));
+            processed_keys.insert(k.to_string());
+        }
+
+        for (k, v) in db_map {
+            if !processed_keys.contains(&k) {
+                settings_list.push((k, v));
+            }
+        }
+
+        if let Some(fk) = filter_key {
+            let fk_lower = fk.to_lowercase();
+            settings_list.retain(|(k, _)| k.to_lowercase().contains(&fk_lower));
+        }
+
+        if settings_list.is_empty() {
+            let desc = if let Some(fk) = filter_key {
+                format!("No settings found matching '{}'.", fk)
+            } else {
+                "No settings found.".to_string()
+            };
+            let embed = create_embed("HealthyBot Settings").description(desc);
             ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
                 .await?;
             return Ok(());
         }
 
         let page_size = 10;
-        let total_pages = settings.len().div_ceil(page_size);
+        let total_pages = settings_list.len().div_ceil(page_size);
         let mut page = 1;
 
         let build_page_data = |page: usize,
                                total_pages: usize,
-                               settings: &[db::Setting]|
+                               settings: &[(String, String)]|
          -> (CreateEmbed, Vec<serenity::CreateActionRow>) {
             let start_idx = (page - 1) * page_size;
             let end_idx = std::cmp::min(start_idx + page_size, settings.len());
@@ -680,8 +765,8 @@ pub async fn settings(
             };
 
             let mut embed = create_embed(&title);
-            for s in &settings[start_idx..end_idx] {
-                embed = embed.field(truncate_str(&s.k, 256), truncate_str(&s.v, 1024), false);
+            for (k, v) in &settings[start_idx..end_idx] {
+                embed = embed.field(truncate_str(k, 256), truncate_str(v, 1024), false);
             }
 
             let components = if total_pages > 1 {
@@ -705,7 +790,7 @@ pub async fn settings(
             (embed, components)
         };
 
-        let (embed, components) = build_page_data(page, total_pages, &settings);
+        let (embed, components) = build_page_data(page, total_pages, &settings_list);
         let reply = ctx
             .send(
                 poise::CreateReply::default()
@@ -724,14 +809,31 @@ pub async fn settings(
                 .timeout(std::time::Duration::from_secs(60))
                 .stream();
 
+            let mut cancelled = false;
             while let Some(interaction) = collector.next().await {
+                if interaction.data.custom_id == "cancel" {
+                    cancelled = true;
+                    let (current_embed, _) = build_page_data(page, total_pages, &settings_list);
+                    interaction
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::UpdateMessage(
+                                serenity::CreateInteractionResponseMessage::new()
+                                    .embed(current_embed)
+                                    .components(vec![]),
+                            ),
+                        )
+                        .await?;
+                    break;
+                }
+
                 match interaction.data.custom_id.as_str() {
                     "prev_page" => page = page.saturating_sub(1),
                     "next_page" => page = std::cmp::min(page + 1, total_pages),
-                    "cancel" => break,
                     _ => continue,
                 }
-                let (new_embed, new_components) = build_page_data(page, total_pages, &settings);
+                let (new_embed, new_components) =
+                    build_page_data(page, total_pages, &settings_list);
                 interaction
                     .create_response(
                         ctx,
@@ -743,9 +845,18 @@ pub async fn settings(
                     )
                     .await?;
             }
-            reply
-                .edit(ctx, poise::CreateReply::default().components(vec![]))
-                .await?;
+
+            if !cancelled {
+                let (final_embed, _) = build_page_data(page, total_pages, &settings_list);
+                let _ = reply
+                    .edit(
+                        ctx,
+                        poise::CreateReply::default()
+                            .embed(final_embed)
+                            .components(vec![]),
+                    )
+                    .await;
+            }
         }
     }
     Ok(())
