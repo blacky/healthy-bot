@@ -691,15 +691,91 @@ pub async fn settings(
         .await?;
     } else {
         let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT * FROM setting")
+            .bind(key.as_deref())
             .fetch_all(pool)
             .await?;
 
-        let mut embed = create_embed("HealthyBot Settings");
-        for s in settings {
-            embed = embed.field(truncate_str(&s.k, 256), truncate_str(&s.v, 1024), false);
+        if settings.is_empty() {
+            let embed = create_embed("HealthyBot Settings").description("No settings found.");
+            ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+                .await?;
+            return Ok(());
         }
-        ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+
+        let page_size = 10;
+        let total_pages = settings.len().div_ceil(page_size);
+        let mut page = 1;
+
+        let build_page_data = |page: usize,
+                               total_pages: usize,
+                               settings: &[db::Setting]|
+         -> (CreateEmbed, Vec<serenity::CreateActionRow>) {
+            let start_idx = (page - 1) * page_size;
+            let end_idx = std::cmp::min(start_idx + page_size, settings.len());
+
+            let title = if total_pages > 1 {
+                format!("HealthyBot Settings (Page {} of {})", page, total_pages)
+            } else {
+                "HealthyBot Settings".to_string()
+            };
+
+            let mut embed = create_embed(&title);
+            for s in &settings[start_idx..end_idx] {
+                embed = embed.field(truncate_str(&s.k, 256), truncate_str(&s.v, 1024), false);
+            }
+
+            let components = if total_pages > 1 {
+                vec![serenity::CreateActionRow::Buttons(vec![
+                    serenity::CreateButton::new("prev_page")
+                        .label("◀")
+                        .style(serenity::ButtonStyle::Secondary)
+                        .disabled(page == 1),
+                    serenity::CreateButton::new("next_page")
+                        .label("▶")
+                        .style(serenity::ButtonStyle::Secondary)
+                        .disabled(page == total_pages),
+                    serenity::CreateButton::new("cancel")
+                        .label("❌")
+                        .style(serenity::ButtonStyle::Danger),
+                ])]
+            } else {
+                vec![]
+            };
+
+            (embed, components)
+        };
+
+        let (embed, components) = build_page_data(page, total_pages, &settings);
+        let reply = ctx
+            .send(
+                poise::CreateReply::default()
+                    .embed(embed)
+                    .components(components)
+                    .ephemeral(true),
+            )
             .await?;
+
+        if total_pages > 1 {
+            let mut collector = reply
+                .message()
+                .await?
+                .await_component_interactions(ctx)
+                .author_id(ctx.author().id)
+                .timeout(std::time::Duration::from_secs(60))
+                .build();
+
+            while let Some(interaction) = collector.next().await {
+                match interaction.data.custom_id.as_str() {
+                    "prev_page" => page = page.saturating_sub(1),
+                    "next_page" => page = std::cmp::min(page + 1, total_pages),
+                    "cancel" => break,
+                    _ => continue,
+                }
+                let (new_embed, new_components) = build_page_data(page, total_pages, &settings);
+                interaction.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(serenity::CreateInteractionResponseMessage::new().embed(new_embed).components(new_components))).await?;
+            }
+            reply.edit(ctx, |b| b.components(vec![])).await?;
+        }
     }
     Ok(())
 }
