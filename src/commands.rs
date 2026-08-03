@@ -772,7 +772,16 @@ pub async fn settings(
                     _ => continue,
                 }
                 let (new_embed, new_components) = build_page_data(page, total_pages, &settings);
-                interaction.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(serenity::CreateInteractionResponseMessage::new().embed(new_embed).components(new_components))).await?;
+                interaction
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .embed(new_embed)
+                                .components(new_components),
+                        ),
+                    )
+                    .await?;
             }
             reply.edit(ctx, |b| b.components(vec![])).await?;
         }
