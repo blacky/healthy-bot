@@ -581,12 +581,18 @@ pub async fn settings(
             "markov_cooldown_seconds"
             | "ai_cooldown_seconds"
             | "tldr_cooldown_seconds"
-            | "random_chime_cooldown_seconds" => {
+            | "random_chime_cooldown_seconds"
+            | "memory_extraction_interval_seconds" => {
                 let _ = value.parse::<u64>().map_err(|_| {
                     user_error(format!(
-                        "Cooldown value '{}' must be a non-negative integer.",
+                        "Value '{}' must be a non-negative integer (seconds).",
                         value
                     ))
+                })?;
+            }
+            "memory_max_facts_per_user" => {
+                let _ = value.parse::<u32>().map_err(|_| {
+                    user_error(format!("Value '{}' must be a non-negative integer.", value))
                 })?;
             }
             "random_chime_chance" => {
@@ -611,7 +617,7 @@ pub async fn settings(
                     ))
                 })?;
             }
-            "ai_chat_model" | "random_chime_model" => {
+            "ai_chat_model" | "random_chime_model" | "memory_model" => {
                 let val_lower = value.to_lowercase();
                 if !(val_lower.starts_with("gpt-")
                     || val_lower.starts_with("o1-")
@@ -625,7 +631,7 @@ pub async fn settings(
                     )));
                 }
             }
-            "reminder_pings" | "ai_debug" | "random_chime_relevance_check" => {
+            "reminder_pings" | "ai_debug" | "random_chime_relevance_check" | "memory_enabled" => {
                 let val_lower = value.to_lowercase();
                 if val_lower != "true" && val_lower != "false" {
                     return Err(user_error(format!(
@@ -1129,6 +1135,161 @@ pub async fn inthards(
     Ok(())
 }
 
+/// Render a user's stored facts as an ephemeral embed.
+async fn reply_facts(ctx: Context<'_>, discord_id: &str, self_view: bool) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let opted_out = db::is_opted_out(pool, discord_id).await;
+    let facts = db::get_facts(pool, discord_id).await;
+
+    let mut embed = create_embed("Memory");
+    if opted_out {
+        embed = embed.description(if self_view {
+            "You are opted out of memory — nothing is stored about you. Use `optin` to re-enable."
+        } else {
+            "This user is opted out of memory."
+        });
+    } else if facts.is_empty() {
+        embed = embed.description("No memories stored.");
+    } else {
+        let body = facts
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("{}. {}", i + 1, f.fact))
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.description(truncate_str(&body, 4000).into_owned());
+        if self_view {
+            embed = embed.footer(CreateEmbedFooter::new(
+                "forget <number> deletes one · forget all clears them",
+            ));
+        }
+    }
+    ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// View or manage what the bot remembers about you
+#[poise::command(
+    slash_command,
+    prefix_command,
+    subcommands(
+        "memory_view",
+        "memory_forget",
+        "memory_clear",
+        "memory_optout",
+        "memory_optin"
+    )
+)]
+pub async fn memory(ctx: Context<'_>) -> Result<(), Error> {
+    reply_facts(ctx, &ctx.author().id.to_string(), true).await
+}
+
+/// View stored facts (yours, or another user's if you're an admin)
+#[poise::command(slash_command, prefix_command, rename = "view")]
+pub async fn memory_view(
+    ctx: Context<'_>,
+    #[description = "User to view (admin only)"] user: Option<serenity::User>,
+) -> Result<(), Error> {
+    match user {
+        Some(u) => {
+            if !is_user_admin(ctx).await {
+                return Err(user_error(
+                    "You are not authorized to view others' memories.",
+                ));
+            }
+            reply_facts(ctx, &u.id.to_string(), false).await
+        }
+        None => reply_facts(ctx, &ctx.author().id.to_string(), true).await,
+    }
+}
+
+/// Forget one of your facts by number, or all of them
+#[poise::command(slash_command, prefix_command, rename = "forget")]
+pub async fn memory_forget(
+    ctx: Context<'_>,
+    #[rest]
+    #[description = "'all', or the number of a fact from `view`"]
+    target: Option<String>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let user_id = ctx.author().id.to_string();
+    let target = target.unwrap_or_default();
+    let target = target.trim();
+
+    if target.eq_ignore_ascii_case("all") {
+        let n = db::clear_facts(pool, &user_id).await?;
+        ctx.say(format!("Cleared {} memory item(s).", n)).await?;
+        return Ok(());
+    }
+
+    let idx: usize = target
+        .parse()
+        .map_err(|_| user_error("Usage: `forget <number>` (from `view`) or `forget all`."))?;
+    if idx == 0 {
+        return Err(user_error("Numbers start at 1. Use `view` to see them."));
+    }
+
+    let facts = db::get_facts(pool, &user_id).await;
+    let Some(fact) = facts.get(idx - 1) else {
+        return Err(user_error(format!(
+            "You only have {} memory item(s).",
+            facts.len()
+        )));
+    };
+
+    if db::delete_fact(pool, &user_id, fact.id).await {
+        ctx.say(format!("Forgot: {}", fact.fact)).await?;
+        Ok(())
+    } else {
+        Err(user_error(
+            "Could not delete that item; it may already be gone.",
+        ))
+    }
+}
+
+/// Clear all of a user's stored facts (admin only)
+#[poise::command(slash_command, prefix_command, rename = "clear")]
+pub async fn memory_clear(
+    ctx: Context<'_>,
+    #[description = "The user whose memory to clear"] user: serenity::User,
+) -> Result<(), Error> {
+    if !is_user_admin(ctx).await {
+        return Err(user_error("Unauthorized"));
+    }
+    let n = db::clear_facts(&ctx.data().db_pool, &user.id.to_string()).await?;
+    ctx.say(format!("Cleared {} memory item(s) for <@{}>.", n, user.id))
+        .await?;
+    Ok(())
+}
+
+/// Opt out of memory: clear your facts and stop remembering anything about you
+#[poise::command(slash_command, prefix_command, rename = "optout")]
+pub async fn memory_optout(ctx: Context<'_>) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let user_id = ctx.author().id.to_string();
+    db::create_user_if_not_exists(pool, &user_id).await?;
+    db::set_opt_out(pool, &user_id, true).await?;
+    let n = db::clear_facts(pool, &user_id).await?;
+    ctx.say(format!(
+        "You are now opted out of memory. Cleared {} stored item(s); nothing new will be remembered.",
+        n
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Opt back in to memory
+#[poise::command(slash_command, prefix_command, rename = "optin")]
+pub async fn memory_optin(ctx: Context<'_>) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let user_id = ctx.author().id.to_string();
+    db::create_user_if_not_exists(pool, &user_id).await?;
+    db::set_opt_out(pool, &user_id, false).await?;
+    ctx.say("You are opted back in to memory.").await?;
+    Ok(())
+}
+
 /// Show help for all commands
 #[poise::command(slash_command, prefix_command)]
 pub async fn help(
@@ -1189,6 +1350,10 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "random_chime_prompt",
         "random_chime_model",
         "random_chime_relevance_check",
+        "memory_enabled",
+        "memory_extraction_interval_seconds",
+        "memory_max_facts_per_user",
+        "memory_model",
     ];
     keys.into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))

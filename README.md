@@ -18,6 +18,7 @@ The primary goal was to address high resource consumption. By moving to a native
 - **Markov Chains:** Learns from user messages to generate hilarious (and often nonsensical) text chains (!markov). Now fully database-backed for extreme memory efficiency.
 - **OpenAI Integration:** Context-aware replies using GPT models. It can follow reply chains and respond naturally to mentions.
 - **Random Interjections:** Occasionally joins conversations on its own in the main channel, gated by a relevance check so it only speaks when it would add value. Off by default; enable with `!settings set random_chime_chance <percent>` (e.g. `2`). Tunable via `random_chime_cooldown_seconds` (minimum gap), `random_chime_daily_cap` (0 = unlimited), `random_chime_relevance_check` (`true`/`false`), and an optional dedicated `random_chime_prompt` / `random_chime_model`.
+- **Memory:** Learns durable facts about users from conversation (via a periodic extraction pass) and injects them into replies and interjections so responses feel personal. On by default; users stay in control with `!memory` (view / forget individual facts / opt out). Tunable via `memory_enabled`, `memory_extraction_interval_seconds`, `memory_max_facts_per_user`, and an optional `memory_model`.
 - **Member Management:** Track user activity ("Inthards") and manage authorized users.
 - **Dynamic Settings:** Configure bot behavior (cooldowns, prompts, status) on-the-fly via commands.
 
@@ -61,6 +62,7 @@ including rollback and the production compose file (`compose.prod.yaml`), see
 - `!remind <message> <time>`: Create a new reminder.
 - `!markov [@user]`: Generate a markov chain.
 - `!user inthards`: View the top list of inactive users.
+- `!memory`: View or manage what the bot remembers about you (`view`, `forget <number|all>`, `optout`, `optin`).
 - `!settings`: View or modify bot configuration.
 - `!help`: Show this message.
 

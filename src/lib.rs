@@ -2,6 +2,7 @@ pub mod chime;
 pub mod commands;
 pub mod db;
 pub mod markov;
+pub mod memory;
 pub mod openai;
 pub mod recent;
 pub mod tasks;

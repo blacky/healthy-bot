@@ -87,3 +87,93 @@ pub async fn update_last_message(
         .await?;
     Ok(())
 }
+
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserFact {
+    pub id: i64,
+    pub discord_id: String,
+    pub fact: String,
+    pub created_at: i64,
+}
+
+/// A user's stored facts, oldest first (creation order).
+pub async fn get_facts(pool: &SqlitePool, discord_id: &str) -> Vec<UserFact> {
+    sqlx::query_as::<_, UserFact>(
+        "SELECT id, discord_id, fact, created_at FROM user_fact WHERE discord_id = ? ORDER BY id ASC",
+    )
+    .bind(discord_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Insert a fact, ignoring exact duplicates (enforced by the unique index).
+pub async fn add_fact(
+    pool: &SqlitePool,
+    discord_id: &str,
+    fact: &str,
+    created_at: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO user_fact (discord_id, fact, created_at) VALUES (?, ?, ?)")
+        .bind(discord_id)
+        .bind(fact)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete a single fact owned by `discord_id`. Returns true if a row was removed
+/// (the ownership check means another user's id can never delete it).
+pub async fn delete_fact(pool: &SqlitePool, discord_id: &str, fact_id: i64) -> bool {
+    sqlx::query("DELETE FROM user_fact WHERE id = ? AND discord_id = ?")
+        .bind(fact_id)
+        .bind(discord_id)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// Delete all of a user's facts, returning how many were removed.
+pub async fn clear_facts(pool: &SqlitePool, discord_id: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query("DELETE FROM user_fact WHERE discord_id = ?")
+        .bind(discord_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// Keep only the `max` newest facts for a user, deleting any older overflow.
+pub async fn prune_facts(pool: &SqlitePool, discord_id: &str, max: u32) -> sqlx::Result<()> {
+    sqlx::query(
+        "DELETE FROM user_fact WHERE discord_id = ? AND id NOT IN \
+         (SELECT id FROM user_fact WHERE discord_id = ? ORDER BY id DESC LIMIT ?)",
+    )
+    .bind(discord_id)
+    .bind(discord_id)
+    .bind(max as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_opt_out(pool: &SqlitePool, discord_id: &str, opt_out: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE users SET memory_opt_out = ? WHERE discord_id = ?")
+        .bind(opt_out)
+        .bind(discord_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn is_opted_out(pool: &SqlitePool, discord_id: &str) -> bool {
+    sqlx::query_as::<_, (bool,)>("SELECT memory_opt_out FROM users WHERE discord_id = ?")
+        .bind(discord_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|(v,)| v)
+        .unwrap_or(false)
+}

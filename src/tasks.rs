@@ -1,10 +1,12 @@
-use crate::db;
+use crate::openai::OpenAIClient;
 use crate::truncate_str;
+use crate::{db, memory, recent};
 use chrono::{Datelike, TimeZone, Utc};
 use chrono_tz::Europe::Amsterdam;
-use serenity::all::{ChannelId, ChannelType, GuildId, Http};
+use serenity::all::{ChannelId, ChannelType, GetMessages, GuildId, Http};
 use serenity::builder::{CreateEmbed, CreateEmbedFooter, CreateMessage};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
@@ -15,7 +17,7 @@ fn create_embed(title: &str) -> CreateEmbed {
         .footer(CreateEmbedFooter::new("Healthy Bot"))
 }
 
-pub async fn start_tasks(pool: SqlitePool, http: Arc<Http>) {
+pub async fn start_tasks(pool: SqlitePool, http: Arc<Http>, openai: OpenAIClient) {
     let pool_clone = pool.clone();
     let http_clone = http.clone();
     tokio::spawn(async move {
@@ -39,6 +41,133 @@ pub async fn start_tasks(pool: SqlitePool, http: Arc<Http>) {
             }
         }
     });
+
+    // Memory extraction. The interval is read each cycle so it can be tuned at
+    // runtime; sleeping first means a restart doesn't immediately trigger a pass.
+    let pool_clone = pool.clone();
+    let http_clone = http.clone();
+    tokio::spawn(async move {
+        loop {
+            let interval_secs = db::get_setting(&pool_clone, "memory_extraction_interval_seconds")
+                .await
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3600)
+                .max(60); // never hammer the API with a tiny/zero interval
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            if let Err(e) = extract_memory(&pool_clone, &http_clone, &openai).await {
+                log::error!("Error extracting memory: {:?}", e);
+            }
+        }
+    });
+}
+
+/// Read recent main-channel messages and extract durable per-user facts into the
+/// database. No-op when memory is disabled or no main channel is configured.
+async fn extract_memory(
+    pool: &SqlitePool,
+    http: &Http,
+    openai: &OpenAIClient,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let enabled = db::get_setting(pool, "memory_enabled")
+        .await
+        .map(|v| v.trim().to_lowercase() != "false")
+        .unwrap_or(true); // on by default
+    if !enabled {
+        return Ok(());
+    }
+
+    let Some(channel_id_str) = db::get_setting(pool, "main_text_channel").await else {
+        return Ok(());
+    };
+    let channel_id: u64 = channel_id_str.parse()?;
+
+    let messages = ChannelId::new(channel_id)
+        .messages(http, GetMessages::new().limit(100))
+        .await?;
+
+    // Collect eligible messages (newest-first; build_transcript reverses them) and
+    // the unique participant roster, skipping bots and opted-out users.
+    let mut entries: Vec<recent::RecentMessage> = Vec::new();
+    let mut participants: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for m in &messages {
+        if m.author.bot || m.content.trim().is_empty() {
+            continue;
+        }
+        let id = m.author.id.to_string();
+        if db::is_opted_out(pool, &id).await {
+            continue;
+        }
+        if seen.insert(id.clone()) {
+            participants.push((id, m.author.name.clone()));
+        }
+        entries.push(recent::RecentMessage {
+            author_name: m.author.name.clone(),
+            content: m.content.clone(),
+            is_bot: false,
+        });
+    }
+
+    if participants.is_empty() {
+        return Ok(());
+    }
+    let Some(transcript) = recent::build_transcript(&entries) else {
+        return Ok(());
+    };
+
+    let model = match db::get_setting(pool, "memory_model")
+        .await
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(m) => m,
+        None => db::get_setting(pool, "ai_chat_model")
+            .await
+            .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+    };
+    let max_facts = db::get_setting(pool, "memory_max_facts_per_user")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(20);
+
+    let request = memory::build_extraction_messages(&participants, &transcript);
+    let response = openai.create_chat(&model, request).await?;
+    let Some(choice) = response.choices.first() else {
+        return Ok(());
+    };
+
+    let facts = memory::parse_extracted_facts(&choice.message.content);
+    if facts.is_empty() {
+        return Ok(());
+    }
+
+    // Only accept facts keyed to a real participant from this batch.
+    let valid_ids: HashSet<&str> = participants.iter().map(|(id, _)| id.as_str()).collect();
+    let now_ms = Utc::now().timestamp_millis();
+    let mut touched: HashSet<String> = HashSet::new();
+
+    for f in facts {
+        if !valid_ids.contains(f.user_id.as_str()) {
+            continue;
+        }
+        if db::add_fact(pool, &f.user_id, &f.fact, now_ms)
+            .await
+            .is_ok()
+        {
+            touched.insert(f.user_id);
+        }
+    }
+
+    for id in &touched {
+        let _ = db::prune_facts(pool, id, max_facts).await;
+    }
+
+    log::info!(
+        "Memory extraction: {} participants, {} users updated",
+        participants.len(),
+        touched.len()
+    );
+    Ok(())
 }
 
 async fn announce_reminders(

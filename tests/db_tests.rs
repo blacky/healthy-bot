@@ -142,3 +142,72 @@ fn test_to_utc_boundary() {
     assert_eq!(dt_ms.timestamp(), 10_000_000);
     assert_eq!(dt_ms.timestamp_subsec_millis(), 1);
 }
+
+#[tokio::test]
+async fn test_facts_add_dedup_and_get() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "111";
+
+    db::add_fact(&pool, uid, "likes hiking", 1).await.unwrap();
+    db::add_fact(&pool, uid, "has a dog", 2).await.unwrap();
+    // Exact duplicate is ignored by the unique index.
+    db::add_fact(&pool, uid, "likes hiking", 3).await.unwrap();
+
+    let facts = db::get_facts(&pool, uid).await;
+    assert_eq!(facts.len(), 2);
+    // Oldest first (creation order).
+    assert_eq!(facts[0].fact, "likes hiking");
+    assert_eq!(facts[1].fact, "has a dog");
+}
+
+#[tokio::test]
+async fn test_delete_fact_is_scoped_to_owner() {
+    let (pool, _temp) = setup_test_db().await;
+    db::add_fact(&pool, "111", "secret", 1).await.unwrap();
+    let id = db::get_facts(&pool, "111").await[0].id;
+
+    // A different user's id cannot delete it.
+    assert!(!db::delete_fact(&pool, "222", id).await);
+    assert_eq!(db::get_facts(&pool, "111").await.len(), 1);
+
+    // The owner can.
+    assert!(db::delete_fact(&pool, "111", id).await);
+    assert!(db::get_facts(&pool, "111").await.is_empty());
+}
+
+#[tokio::test]
+async fn test_prune_keeps_newest() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "111";
+    for i in 0..5 {
+        db::add_fact(&pool, uid, &format!("fact {}", i), i)
+            .await
+            .unwrap();
+    }
+
+    db::prune_facts(&pool, uid, 2).await.unwrap();
+
+    let facts = db::get_facts(&pool, uid).await;
+    assert_eq!(facts.len(), 2);
+    // The two newest (highest ids) survive.
+    assert_eq!(facts[0].fact, "fact 3");
+    assert_eq!(facts[1].fact, "fact 4");
+}
+
+#[tokio::test]
+async fn test_opt_out_toggle_and_default() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "111";
+    db::create_user_if_not_exists(&pool, uid).await.unwrap();
+
+    // Default is opted in.
+    assert!(!db::is_opted_out(&pool, uid).await);
+    // Unknown user also reports opted-in.
+    assert!(!db::is_opted_out(&pool, "999").await);
+
+    db::set_opt_out(&pool, uid, true).await.unwrap();
+    assert!(db::is_opted_out(&pool, uid).await);
+
+    db::set_opt_out(&pool, uid, false).await.unwrap();
+    assert!(!db::is_opted_out(&pool, uid).await);
+}
