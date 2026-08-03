@@ -123,7 +123,7 @@ jobs:
                -d '{"fight_mode":false}'
           
           echo "Waiting 10 seconds for Cloudflare edge propagation..."
-          sleep 10
+          sleep 45
 
 # Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
       # Komodo verifies the HMAC-SHA256 signature against KOMODO_WEBHOOK_SECRET,
