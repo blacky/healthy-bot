@@ -10,7 +10,7 @@
 services:
   healthy-bot:
     container_name: healthy-bot
-    image: ${HEALTHYBOT_IMAGE:-ghcr.io/buracc/healthy-bot-rust}:${IMAGE_TAG:-latest}
+    image: ${HEALTHYBOT_IMAGE:-ghcr.io/blacky/healthy-bot}:${IMAGE_TAG:-latest}
     env_file:
       - .env
     environment:
