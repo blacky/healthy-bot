@@ -334,9 +334,7 @@ pub async fn remind_cmd(
                     )
                     .await?;
             }
-            reply
-                .edit(ctx, |b| b.components(vec![]))
-                .await?;
+            reply.edit(ctx, |b| b.components(vec![])).await?;
         }
 
         return Ok(());
@@ -743,11 +741,7 @@ pub async fn settings(
                     )
                     .await?;
             }
-            reply
-                .edit(ctx, |b: &mut poise::CreateReply| {
-                    b.components(vec![])
-                })
-                .await?;
+            reply.edit(ctx, |b: &mut poise::CreateReply| b.components(vec![])).await?;
         }
     }
     Ok(())
