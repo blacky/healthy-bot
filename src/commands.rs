@@ -319,7 +319,7 @@ pub async fn remind_cmd(
                     cancelled = true;
                     let (current_embed, _) =
                         build_page_data(page, total_pages, &reminders, now_ams);
-                    interaction
+                    let _ = interaction
                         .create_response(
                             ctx,
                             serenity::CreateInteractionResponse::UpdateMessage(
@@ -328,7 +328,7 @@ pub async fn remind_cmd(
                                     .components(vec![]),
                             ),
                         )
-                        .await?;
+                        .await;
                     break;
                 }
 
@@ -340,7 +340,7 @@ pub async fn remind_cmd(
 
                 let (new_embed, new_components) =
                     build_page_data(page, total_pages, &reminders, now_ams);
-                interaction
+                let _ = interaction
                     .create_response(
                         ctx,
                         serenity::CreateInteractionResponse::UpdateMessage(
@@ -349,7 +349,7 @@ pub async fn remind_cmd(
                                 .components(new_components),
                         ),
                     )
-                    .await?;
+                    .await;
             }
 
             if !cancelled {
@@ -716,6 +716,10 @@ pub async fn settings(
             ("random_chime_prompt", "(fallback to ai_initial_prompt)"),
             ("random_chime_model", "(fallback to ai_chat_model)"),
             ("random_chime_relevance_check", "true"),
+            ("memory_enabled", "true"),
+            ("memory_extraction_interval_seconds", "3600"),
+            ("memory_max_facts_per_user", "20"),
+            ("memory_model", "(fallback to ai_chat_model)"),
         ];
 
         let mut settings_list: Vec<(String, String)> = Vec::new();
@@ -820,7 +824,7 @@ pub async fn settings(
                 if interaction.data.custom_id == "cancel" {
                     cancelled = true;
                     let (current_embed, _) = build_page_data(page, total_pages, &settings_list);
-                    interaction
+                    let _ = interaction
                         .create_response(
                             ctx,
                             serenity::CreateInteractionResponse::UpdateMessage(
@@ -829,7 +833,7 @@ pub async fn settings(
                                     .components(vec![]),
                             ),
                         )
-                        .await?;
+                        .await;
                     break;
                 }
 
@@ -840,7 +844,7 @@ pub async fn settings(
                 }
                 let (new_embed, new_components) =
                     build_page_data(page, total_pages, &settings_list);
-                interaction
+                let _ = interaction
                     .create_response(
                         ctx,
                         serenity::CreateInteractionResponse::UpdateMessage(
@@ -849,7 +853,7 @@ pub async fn settings(
                                 .components(new_components),
                         ),
                     )
-                    .await?;
+                    .await;
             }
 
             if !cancelled {
