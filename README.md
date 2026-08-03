@@ -17,6 +17,7 @@ The primary goal was to address high resource consumption. By moving to a native
 - **Reminders:** A flexible reminder system (!remind) to keep track of tasks, events, or anything else.
 - **Markov Chains:** Learns from user messages to generate hilarious (and often nonsensical) text chains (!markov). Now fully database-backed for extreme memory efficiency.
 - **OpenAI Integration:** Context-aware replies using GPT models. It can follow reply chains and respond naturally to mentions.
+- **Random Interjections:** Occasionally joins conversations on its own in the main channel. Off by default; enable with `!settings set random_chime_chance <percent>` (e.g. `2`), tune the minimum gap with `random_chime_cooldown_seconds`.
 - **Member Management:** Track user activity ("Inthards") and manage authorized users.
 - **Dynamic Settings:** Configure bot behavior (cooldowns, prompts, status) on-the-fly via commands.
 
