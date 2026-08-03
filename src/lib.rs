@@ -1,3 +1,4 @@
+pub mod chime;
 pub mod commands;
 pub mod db;
 pub mod markov;
@@ -19,6 +20,7 @@ pub struct Data {
     pub last_markov: tokio::sync::Mutex<std::time::Instant>,
     pub last_openai: tokio::sync::Mutex<std::time::Instant>,
     pub last_tldr: tokio::sync::Mutex<std::time::Instant>,
+    pub last_random_chime: tokio::sync::Mutex<std::time::Instant>,
     pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
