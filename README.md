@@ -41,7 +41,7 @@ The bot is configured via environment variables. You can set these in a .env fil
 
 ## Deployment
 
-The project includes a `Dockerfile` and `compose.yaml` for easy deployment.
+The project includes a `Dockerfile` and `compose.yaml` for easy local deployment.
 
 ```bash
 docker-compose up -d
@@ -50,6 +50,10 @@ docker-compose up -d
 Ensure your volumes are mapped correctly for persistence:
 - `/healthybot/db`: Database storage (includes Markov chains).
 - `/healthybot/data`: Legacy Markov model data for migration.
+
+For automated build-and-deploy (push to `main` → GHCR → Komodo redeploy),
+including rollback and the production compose file (`compose.prod.yaml`), see
+[docs/deployment.md](docs/deployment.md).
 
 ## Commands
 
