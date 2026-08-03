@@ -110,7 +110,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
+# Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
       # Komodo verifies the HMAC-SHA256 signature against KOMODO_WEBHOOK_SECRET,
       # matches the branch in the payload, then pulls the new image and recreates
       # the stack.
@@ -128,4 +128,5 @@ jobs:
             -H 'Content-Type: application/json' \
             -H 'X-GitHub-Event: push' \
             -H "X-Hub-Signature-256: $sig" \
+            -H "User-Agent: GitHub-Actions-Deploy" \
             -d "$payload"
