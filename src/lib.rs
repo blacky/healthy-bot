@@ -18,6 +18,7 @@ pub struct Data {
     pub openai_client: OpenAIClient,
     pub last_markov: tokio::sync::Mutex<std::time::Instant>,
     pub last_openai: tokio::sync::Mutex<std::time::Instant>,
+    pub last_tldr: tokio::sync::Mutex<std::time::Instant>,
     pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
@@ -56,4 +57,26 @@ pub fn truncate_str(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
         let kept: String = s.chars().take(max.saturating_sub(1)).collect();
         std::borrow::Cow::Owned(format!("{}…", kept))
     }
+}
+
+/// Split `content` into consecutive chunks each at most `limit` bytes long,
+/// without ever splitting a UTF-8 codepoint. Discord rejects any single message
+/// longer than 2000 characters, so long replies must be sent as several
+/// messages. Chunks borrow from `content`; an empty input yields no chunks.
+///
+/// `limit` is a byte bound. Since a byte count is always >= the character count,
+/// a 2000-byte chunk never exceeds Discord's 2000-character limit.
+pub fn split_message(content: &str, limit: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < content.len() {
+        let mut end = std::cmp::min(start + limit, content.len());
+        // Walk back to the nearest char boundary so we never slice a codepoint.
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&content[start..end]);
+        start = end;
+    }
+    chunks
 }

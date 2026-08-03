@@ -3,7 +3,7 @@ use healthy_bot::openai::{
     sanitize_name, ChatMessage, ChatMessageRequestContent, ContentPart, ImageUrlTarget,
     OpenAIClient,
 };
-use healthy_bot::{commands, db, tasks, Data, Error, UserError};
+use healthy_bot::{commands, db, split_message, tasks, Data, Error, UserError};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use std::collections::HashMap;
@@ -236,20 +236,13 @@ async fn event_handler(
                                 content.len()
                             );
                             let mut last_sent: Option<serenity::Message> = None;
-                            let mut start = 0;
-                            while start < content.len() {
-                                let mut end = std::cmp::min(start + 2000, content.len());
-                                while !content.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                let chunk = &content[start..end];
+                            for chunk in split_message(content, 2000) {
                                 let sent = if let Some(ref prev) = last_sent {
                                     prev.reply(ctx, chunk).await.ok()
                                 } else {
                                     new_message.reply(ctx, chunk).await.ok()
                                 };
                                 last_sent = sent;
-                                start = end;
                             }
                             log::info!("OpenAI replied to {}", new_message.author.name);
                         }
@@ -359,6 +352,9 @@ async fn main() {
         last_openai: tokio::sync::Mutex::new(
             std::time::Instant::now() - std::time::Duration::from_secs(3600),
         ),
+        last_tldr: tokio::sync::Mutex::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        ),
         settings_cache: settings_cache.clone(),
     };
 
@@ -385,6 +381,7 @@ async fn main() {
             commands: vec![
                 commands::remind_cmd(),
                 commands::markov(),
+                commands::tldr(),
                 commands::settings(),
                 commands::user_cmd(),
                 commands::inthards(),

@@ -1,4 +1,6 @@
 use crate::db;
+use crate::openai::{ChatMessage, ChatMessageRequestContent};
+use crate::split_message;
 use crate::truncate_str;
 use crate::user_error;
 use crate::Data;
@@ -441,6 +443,137 @@ pub async fn markov(ctx: Context<'_>, user: Option<serenity::User>) -> Result<()
         log::warn!("Markov generation failed or no data for {}", target_id);
         ctx.say("Crack cocaine").await?;
     }
+    Ok(())
+}
+
+/// A channel message reduced to what the summarizer needs. Decoupled from
+/// serenity's `Message` so [`build_transcript`] can be unit-tested without
+/// constructing Discord types.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptEntry {
+    pub name: String,
+    pub content: String,
+    pub is_bot: bool,
+}
+
+/// Turn channel messages — as Discord returns them, newest-first — into a plain
+/// chronological transcript (`Name: message` per line) for summarization. Bot
+/// messages and entries that are blank after trimming are dropped. Returns
+/// `None` when nothing summarizable remains.
+pub fn build_transcript(messages: &[TranscriptEntry]) -> Option<String> {
+    let lines: Vec<String> = messages
+        .iter()
+        .rev() // Discord returns newest-first; a transcript should read oldest-first.
+        .filter(|m| !m.is_bot && !m.content.trim().is_empty())
+        .map(|m| format!("{}: {}", m.name, m.content.trim()))
+        .collect();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Summarize the recent conversation in the current channel
+#[poise::command(slash_command, prefix_command)]
+pub async fn tldr(
+    ctx: Context<'_>,
+    #[description = "How many recent messages to summarize (default 50, max 100)"] count: Option<
+        i64,
+    >,
+) -> Result<(), Error> {
+    // Cooldown check, mirroring the markov / AI throttling pattern.
+    let cooldown_secs: u64 = {
+        let cache = ctx.data().settings_cache.read().await;
+        cache
+            .get("tldr_cooldown_seconds")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    {
+        let mut last_inv = ctx.data().last_tldr.lock().await;
+        if last_inv.elapsed().as_secs() < cooldown_secs {
+            return Ok(());
+        }
+        *last_inv = std::time::Instant::now();
+    }
+
+    // 100 is Discord's single-fetch cap, so we never paginate.
+    let limit = count.unwrap_or(50).clamp(1, 100) as u8;
+
+    let messages = ctx
+        .channel_id()
+        .messages(
+            ctx.http(),
+            serenity::builder::GetMessages::new().limit(limit),
+        )
+        .await?;
+
+    let entries: Vec<TranscriptEntry> = messages
+        .iter()
+        .map(|m| TranscriptEntry {
+            name: m.author.name.clone(),
+            // content_safe renders mentions as names instead of raw <@id> tokens.
+            content: m.content_safe(ctx.cache()),
+            is_bot: m.author.bot,
+        })
+        .collect();
+
+    let transcript = build_transcript(&entries)
+        .ok_or_else(|| user_error("There's nothing recent to summarize here."))?;
+
+    let chat_model = {
+        let cache = ctx.data().settings_cache.read().await;
+        cache
+            .get("ai_chat_model")
+            .cloned()
+            .unwrap_or_else(|| "gpt-4o-mini".to_string())
+    };
+
+    let request = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            name: None,
+            content: ChatMessageRequestContent::Text(
+                "You are a summarizer for a Discord channel. You are given a chronological \
+                 transcript of messages formatted as `Name: message`. Produce a concise \
+                 summary of the discussion as a few short bullet points, focusing on the key \
+                 topics, decisions, and open questions. Do not invent information that is not \
+                 present in the transcript."
+                    .to_string(),
+            ),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            name: None,
+            content: ChatMessageRequestContent::Text(transcript),
+        },
+    ];
+
+    let _typing = ctx.channel_id().start_typing(&ctx.serenity_context().http);
+
+    let response = ctx
+        .data()
+        .openai_client
+        .create_chat(&chat_model, request)
+        .await?;
+
+    let summary = response
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    if summary.trim().is_empty() {
+        return Err(user_error("The summarizer returned an empty response."));
+    }
+
+    // Discord caps a single message at 2000 chars; send the summary in pieces.
+    for chunk in split_message(&summary, 2000) {
+        ctx.say(chunk).await?;
+    }
+
     Ok(())
 }
 
@@ -887,6 +1020,7 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "reminder_category",
         "markov_cooldown_seconds",
         "ai_cooldown_seconds",
+        "tldr_cooldown_seconds",
         "ai_initial_prompt",
         "ai_chat_model",
         "bot_status_type",
