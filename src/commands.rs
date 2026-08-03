@@ -305,78 +305,38 @@ pub async fn remind_cmd(
             .await?;
 
         if total_pages > 1 {
-            let mut m = reply.into_message().await?;
-            let mut collector = serenity::collector::ComponentInteractionCollector::new(ctx)
-                .filter(move |int| int.message.id == m.id)
+            let mut collector = reply
+                .message()
+                .await?
+                .await_component_interactions(ctx)
+                .author_id(ctx.author().id)
                 .timeout(std::time::Duration::from_secs(60))
-                .stream();
+                .build();
 
-            let mut canceled = false;
             while let Some(interaction) = collector.next().await {
-                if interaction.user.id != ctx.author().id {
-                    let _ = interaction
-                        .create_response(
-                            ctx.http(),
-                            serenity::CreateInteractionResponse::Message(
-                                serenity::CreateInteractionResponseMessage::new()
-                                    .content("You cannot control this pagination.")
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await;
-                    continue;
-                }
-
-                let action = interaction.data.custom_id.as_str();
-                match action {
-                    "prev_page" => {
-                        if page > 1 {
-                            page -= 1;
-                        }
-                    }
-                    "next_page" => {
-                        if page < total_pages {
-                            page += 1;
-                        }
-                    }
-                    "cancel" => {
-                        let (final_embed, _) =
-                            build_page_data(page, total_pages, &reminders, now_ams);
-                        let _ = interaction
-                            .create_response(
-                                ctx.http(),
-                                serenity::CreateInteractionResponse::UpdateMessage(
-                                    serenity::CreateInteractionResponseMessage::new()
-                                        .embed(final_embed)
-                                        .components(vec![]),
-                                ),
-                            )
-                            .await;
-                        canceled = true;
-                        break;
-                    }
-                    _ => {}
+                match interaction.data.custom_id.as_str() {
+                    "prev_page" => page = page.saturating_sub(1),
+                    "next_page" => page = std::cmp::min(page + 1, total_pages),
+                    "cancel" => break,
+                    _ => continue,
                 }
 
                 let (new_embed, new_components) =
                     build_page_data(page, total_pages, &reminders, now_ams);
-                let _ = interaction
+                interaction
                     .create_response(
-                        ctx.http(),
+                        ctx,
                         serenity::CreateInteractionResponse::UpdateMessage(
                             serenity::CreateInteractionResponseMessage::new()
                                 .embed(new_embed)
                                 .components(new_components),
                         ),
                     )
-                    .await;
+                    .await?;
             }
-
-            if !canceled {
-                let _ = m
-                    .edit(ctx, serenity::EditMessage::new().components(vec![]))
-                    .await;
-            }
+            reply
+                .edit(ctx, |b| b.components(vec![]))
+                .await?;
         }
 
         return Ok(());
@@ -783,7 +743,11 @@ pub async fn settings(
                     )
                     .await?;
             }
-            reply.edit(ctx, |b| b.components(vec![])).await?;
+            reply
+                .edit(ctx, |b: &mut poise::CreateReply| {
+                    b.components(vec![])
+                })
+                .await?;
         }
     }
     Ok(())
