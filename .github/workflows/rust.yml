@@ -112,13 +112,18 @@ jobs:
 
       - name: Temporarily Disable Bot Fight Mode
         if: steps.guard.outputs.enabled == 'true'
-        uses: xiaotianxt/bypass-cloudflare-for-github-action@v2.1.0
-        with:
-          cf_account_id: ${{ secrets.CF_ACCOUNT_ID }}
-          cf_zone_id: ${{ secrets.CF_ZONE_ID }}
-          cf_api_token: ${{ secrets.CF_API_TOKEN }}
-          disable_bot_fight_mode: true
-          bfm_propagation_delay: 10
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "Disabling Bot Fight Mode..."
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+               -H "Authorization: Bearer $CF_API_TOKEN" \
+               -H "Content-Type: application/json" \
+               -d '{"fight_mode":false}'
+          
+          echo "Waiting 10 seconds for Cloudflare edge propagation..."
+          sleep 10
 
 # Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
       # Komodo verifies the HMAC-SHA256 signature against KOMODO_WEBHOOK_SECRET,
