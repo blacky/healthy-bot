@@ -741,7 +741,9 @@ pub async fn settings(
                     )
                     .await?;
             }
-            reply.edit(ctx, |b: &mut poise::CreateReply| b.components(vec![])).await?;
+            reply
+                .edit(ctx, |b: &mut poise::CreateReply| b.components(vec![]))
+                .await?;
         }
     }
     Ok(())
