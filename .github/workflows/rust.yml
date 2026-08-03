@@ -145,3 +145,16 @@ jobs:
             -H "X-Hub-Signature-256: $sig" \
             -H "User-Agent: GitHub-Actions-Deploy" \
             -d "$payload"
+
+# Always Re-enable Bot Fight Mode (even if the webhook fails)
+      - name: Re-enable Bot Fight Mode
+        if: always() && steps.guard.outputs.enabled == 'true'
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "Re-enabling Bot Fight Mode..."
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+               -H "Authorization: Bearer $CF_API_TOKEN" \
+               -H "Content-Type: application/json" \
+               -d '{"fight_mode":true}'
