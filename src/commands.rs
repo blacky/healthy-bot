@@ -311,7 +311,7 @@ pub async fn remind_cmd(
                 .await_component_interactions(ctx)
                 .author_id(ctx.author().id)
                 .timeout(std::time::Duration::from_secs(60))
-                .build();
+                .stream();
 
             while let Some(interaction) = collector.next().await {
                 match interaction.data.custom_id.as_str() {
@@ -334,7 +334,9 @@ pub async fn remind_cmd(
                     )
                     .await?;
             }
-            reply.edit(ctx, |b| b.components(vec![])).await?;
+            reply
+                .edit(ctx, poise::CreateReply::default().components(vec![]))
+                .await?;
         }
 
         return Ok(());
@@ -720,7 +722,7 @@ pub async fn settings(
                 .await_component_interactions(ctx)
                 .author_id(ctx.author().id)
                 .timeout(std::time::Duration::from_secs(60))
-                .build();
+                .stream();
 
             while let Some(interaction) = collector.next().await {
                 match interaction.data.custom_id.as_str() {
@@ -742,7 +744,7 @@ pub async fn settings(
                     .await?;
             }
             reply
-                .edit(ctx, |b: &mut poise::CreateReply| b.components(vec![]))
+                .edit(ctx, poise::CreateReply::default().components(vec![]))
                 .await?;
         }
     }
