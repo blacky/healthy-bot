@@ -5,7 +5,7 @@ use healthy_bot::openai::{
     OpenAIClient,
 };
 use healthy_bot::{
-    commands, db, recent, split_message, tasks, truncate_str, Data, Error, UserError,
+    commands, db, memory, recent, split_message, tasks, truncate_str, Data, Error, UserError,
 };
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
@@ -97,6 +97,12 @@ async fn event_handler(
                         .cloned()
                         .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
                 )
+            };
+
+            // Prepend what the bot remembers about the participants, if anything.
+            let bot_context = match build_memory_prefix(data, new_message).await {
+                Some(mem) => format!("{}\n\n{}", bot_context, mem),
+                None => bot_context,
             };
 
             let bot_name = ctx.cache.current_user().name.clone();
@@ -400,6 +406,7 @@ async fn main() {
                 commands::tldr(),
                 commands::settings(),
                 commands::user_cmd(),
+                commands::memory(),
                 commands::inthards(),
                 commands::status(),
                 commands::help(),
@@ -496,8 +503,13 @@ async fn main() {
                 poise::builtins::register_globally(ctx, &_framework.options().commands).await?;
                 log::info!("Slash commands registered globally");
 
-                tasks::start_tasks(data.db_pool.clone(), ctx.http.clone()).await;
-                log::info!("Background tasks started (Reminders, VC Updates)");
+                tasks::start_tasks(
+                    data.db_pool.clone(),
+                    ctx.http.clone(),
+                    data.openai_client.clone(),
+                )
+                .await;
+                log::info!("Background tasks started (Reminders, VC Updates, Memory)");
 
                 // One-time database cleanup for legacy settings
                 let pool = data.db_pool.clone();
@@ -580,6 +592,44 @@ async fn main() {
     if let Err(why) = client.start().await {
         log::error!("Client error: {:?}", why);
     }
+}
+
+/// Gather stored facts for the message author and any users they mention, and
+/// format them as a memory block to prepend to a system prompt. Returns `None`
+/// when memory is disabled, everyone involved is opted out, or nothing is known.
+async fn build_memory_prefix(data: &Data, new_message: &serenity::Message) -> Option<String> {
+    let enabled = {
+        let cache = data.settings_cache.read().await;
+        cache
+            .get("memory_enabled")
+            .map(|v| v.trim().to_lowercase() != "false")
+            .unwrap_or(true) // on by default
+    };
+    if !enabled {
+        return None;
+    }
+
+    let mut people: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for user in std::iter::once(&new_message.author).chain(new_message.mentions.iter()) {
+        if !seen.insert(user.id.get()) {
+            continue;
+        }
+        let id = user.id.to_string();
+        if db::is_opted_out(&data.db_pool, &id).await {
+            continue;
+        }
+        let facts: Vec<String> = db::get_facts(&data.db_pool, &id)
+            .await
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        if !facts.is_empty() {
+            people.push((user.name.clone(), facts));
+        }
+    }
+
+    memory::format_memory_context(&people)
 }
 
 /// System prompt for the relevance pre-check — a cheap yes/no gate that runs
@@ -741,12 +791,15 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
         }
     }
 
-    let system_prompt = format!(
+    let mut system_prompt = format!(
         "{}\n\nYou are spontaneously joining an ongoing conversation in a chat channel. \
          Keep your interjection short, casual, and relevant to what is being discussed. \
          Do not introduce yourself or explain that you are a bot.",
         base_prompt
     );
+    if let Some(mem) = build_memory_prefix(data, new_message).await {
+        system_prompt = format!("{}\n\n{}", system_prompt, mem);
+    }
     let messages = recent::build_chat_messages(&system_prompt, &entries);
 
     log::info!(

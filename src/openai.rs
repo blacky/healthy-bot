@@ -118,7 +118,7 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpenAIClient {
     pub client: Client,
     pub api_key: String,
