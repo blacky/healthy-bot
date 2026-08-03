@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod markov;
 pub mod openai;
+pub mod recent;
 pub mod tasks;
 
 use crate::markov::MarkovRepository;

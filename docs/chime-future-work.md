@@ -78,9 +78,6 @@ within each section. Nothing here is committed to — it's a backlog.
   `ChimeDecision::evaluate(...) -> Decision` (enum: `Skip(reason)` / `Fire`)
   would make the whole decision path unit-testable, not just the two leaf
   helpers.
-- **Deduplicate transcript building.** `build_chime_messages` overlaps with the
-  `build_transcript` helper in the tldr work (PR #2). If both land, unify them
-  into one shared "recent messages → ChatMessages" helper.
 - **Multi-guild settings.** Settings are global today. Supporting the bot across
   multiple guilds would require per-guild settings, which affects chime scope
   and channel config too.

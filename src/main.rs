@@ -1,10 +1,12 @@
-use healthy_bot::chime::{self, ChimeEntry};
+use healthy_bot::chime;
 use healthy_bot::markov::MarkovRepository;
 use healthy_bot::openai::{
     sanitize_name, ChatMessage, ChatMessageRequestContent, ContentPart, ImageUrlTarget,
     OpenAIClient,
 };
-use healthy_bot::{commands, db, split_message, tasks, truncate_str, Data, Error, UserError};
+use healthy_bot::{
+    commands, db, recent, split_message, tasks, truncate_str, Data, Error, UserError,
+};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use std::collections::HashMap;
@@ -635,7 +637,7 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
         *last = std::time::Instant::now();
     }
 
-    let recent = match new_message
+    let recent_messages = match new_message
         .channel_id
         .messages(&ctx.http, serenity::builder::GetMessages::new().limit(10))
         .await
@@ -648,9 +650,9 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
     };
 
     let bot_id = ctx.cache.current_user().id;
-    let entries: Vec<ChimeEntry> = recent
+    let entries: Vec<recent::RecentMessage> = recent_messages
         .iter()
-        .map(|m| ChimeEntry {
+        .map(|m| recent::RecentMessage {
             author_name: m.author.name.clone(),
             content: m.content_safe(&ctx.cache),
             is_bot: m.author.id == bot_id,
@@ -663,7 +665,7 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
          Do not introduce yourself or explain that you are a bot.",
         base_prompt
     );
-    let messages = chime::build_chime_messages(&system_prompt, &entries);
+    let messages = recent::build_chat_messages(&system_prompt, &entries);
 
     log::info!(
         "Random chime triggered in channel {}",
