@@ -1,9 +1,10 @@
+use healthy_bot::chime::{self, ChimeEntry};
 use healthy_bot::markov::MarkovRepository;
 use healthy_bot::openai::{
     sanitize_name, ChatMessage, ChatMessageRequestContent, ContentPart, ImageUrlTarget,
     OpenAIClient,
 };
-use healthy_bot::{commands, db, split_message, tasks, Data, Error, UserError};
+use healthy_bot::{commands, db, split_message, tasks, truncate_str, Data, Error, UserError};
 use poise::serenity_prelude as serenity;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use std::collections::HashMap;
@@ -262,6 +263,11 @@ async fn event_handler(
                 .delete_reaction(&ctx.http, None, thinking_reaction)
                 .await;
         }
+
+        // Not addressed directly — consider a spontaneous random chime.
+        if !mentioned && !replied {
+            try_random_chime(ctx, data, new_message).await;
+        }
     }
     Ok(())
 }
@@ -353,6 +359,9 @@ async fn main() {
             std::time::Instant::now() - std::time::Duration::from_secs(3600),
         ),
         last_tldr: tokio::sync::Mutex::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+        ),
+        last_random_chime: tokio::sync::Mutex::new(
             std::time::Instant::now() - std::time::Duration::from_secs(3600),
         ),
         settings_cache: settings_cache.clone(),
@@ -563,6 +572,121 @@ async fn main() {
     log::info!("Starting client...");
     if let Err(why) = client.start().await {
         log::error!("Client error: {:?}", why);
+    }
+}
+
+/// Occasionally join a conversation on the bot's own initiative.
+///
+/// Called for human messages in which the bot was *not* mentioned or replied to.
+/// It only acts when the feature is enabled (`random_chime_chance` > 0), the
+/// message is in the configured main channel and passes the eligibility checks,
+/// a per-channel cooldown has elapsed, and a probability roll succeeds. On
+/// success it feeds the recent conversation to OpenAI and posts a standalone
+/// message. All failures are logged and swallowed — a chime is best-effort.
+async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &serenity::Message) {
+    let (chance, cooldown_secs, main_channel, prefix, base_prompt, chat_model) = {
+        let cache = data.settings_cache.read().await;
+        (
+            cache
+                .get("random_chime_chance")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0),
+            cache
+                .get("random_chime_cooldown_seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600),
+            cache.get("main_text_channel").cloned(),
+            cache
+                .get("command_prefix")
+                .cloned()
+                .unwrap_or_else(|| "!".to_string()),
+            cache
+                .get("ai_initial_prompt")
+                .cloned()
+                .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+            cache
+                .get("ai_chat_model")
+                .cloned()
+                .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+        )
+    };
+
+    if chance <= 0.0 {
+        return;
+    }
+
+    let in_main_channel =
+        main_channel.as_deref() == Some(new_message.channel_id.to_string().as_str());
+    // `mentioned`/`replied` are already false here (checked by the caller).
+    if !chime::is_chime_eligible(&new_message.content, &prefix, in_main_channel, false, false) {
+        return;
+    }
+
+    // Cooldown gates the time between *actual* chimes: only a successful roll
+    // resets the timer, so failed rolls don't start the cooldown.
+    {
+        let mut last = data.last_random_chime.lock().await;
+        if last.elapsed().as_secs() < cooldown_secs {
+            return;
+        }
+        if !chime::should_fire(chance, rand::random::<f64>()) {
+            return;
+        }
+        *last = std::time::Instant::now();
+    }
+
+    let recent = match new_message
+        .channel_id
+        .messages(&ctx.http, serenity::builder::GetMessages::new().limit(10))
+        .await
+    {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            log::error!("Random chime: failed to fetch recent messages: {:?}", e);
+            return;
+        }
+    };
+
+    let bot_id = ctx.cache.current_user().id;
+    let entries: Vec<ChimeEntry> = recent
+        .iter()
+        .map(|m| ChimeEntry {
+            author_name: m.author.name.clone(),
+            content: m.content_safe(&ctx.cache),
+            is_bot: m.author.id == bot_id,
+        })
+        .collect();
+
+    let system_prompt = format!(
+        "{}\n\nYou are spontaneously joining an ongoing conversation in a chat channel. \
+         Keep your interjection short, casual, and relevant to what is being discussed. \
+         Do not introduce yourself or explain that you are a bot.",
+        base_prompt
+    );
+    let messages = chime::build_chime_messages(&system_prompt, &entries);
+
+    log::info!(
+        "Random chime triggered in channel {}",
+        new_message.channel_id
+    );
+    let _typing = new_message.channel_id.start_typing(&ctx.http);
+
+    match data.openai_client.create_chat(&chat_model, messages).await {
+        Ok(response) => {
+            if let Some(choice) = response.choices.first() {
+                let content = choice.message.content.trim();
+                if !content.is_empty() {
+                    // Post as a standalone message (no reply-ping) so it reads as
+                    // casually joining in. Chimes are meant to be short; truncate
+                    // to Discord's 2000-char limit rather than splitting.
+                    let _ = new_message
+                        .channel_id
+                        .say(&ctx.http, truncate_str(content, 2000).into_owned())
+                        .await;
+                }
+            }
+        }
+        Err(e) => log::error!("Random chime OpenAI error: {:?}", e),
     }
 }
 

@@ -620,13 +620,30 @@ pub async fn settings(
                     )));
                 }
             }
-            "markov_cooldown_seconds" | "ai_cooldown_seconds" => {
+            "markov_cooldown_seconds"
+            | "ai_cooldown_seconds"
+            | "tldr_cooldown_seconds"
+            | "random_chime_cooldown_seconds" => {
                 let _ = value.parse::<u64>().map_err(|_| {
                     user_error(format!(
                         "Cooldown value '{}' must be a non-negative integer.",
                         value
                     ))
                 })?;
+            }
+            "random_chime_chance" => {
+                let pct = value.parse::<f64>().map_err(|_| {
+                    user_error(format!(
+                        "Chance '{}' must be a number between 0 and 100.",
+                        value
+                    ))
+                })?;
+                if !(0.0..=100.0).contains(&pct) {
+                    return Err(user_error(format!(
+                        "Chance '{}' must be between 0 and 100.",
+                        value
+                    )));
+                }
             }
             "ai_chat_model" => {
                 let val_lower = value.to_lowercase();
@@ -1028,6 +1045,8 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "allowed_bot_id",
         "ai_debug",
         "reminder_pings",
+        "random_chime_chance",
+        "random_chime_cooldown_seconds",
     ];
     keys.into_iter()
         .filter(move |name| name.to_lowercase().starts_with(&partial.to_lowercase()))
