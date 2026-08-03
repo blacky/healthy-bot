@@ -122,7 +122,7 @@ jobs:
                -H "Content-Type: application/json" \
                -d '{"fight_mode":false}'
           
-          echo "Waiting 10 seconds for Cloudflare edge propagation..."
+          echo "Waiting 45 seconds for Cloudflare edge propagation..."
           sleep 45
 
 # Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
