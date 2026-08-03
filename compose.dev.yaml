@@ -1,0 +1,11 @@
+services:
+  healthy-bot:
+    container_name: healthy-bot-dev
+    image: healthy-bot-dev:latest
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - /opt/containers/healthy-bot-dev/data:/healthybot/data
+      - /opt/containers/healthy-bot-dev/db:/healthybot/db
+    restart: unless-stopped
