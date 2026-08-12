@@ -16,6 +16,26 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 
 const HOF_ROLE_ID: u64 = 446675275179098113;
 
+pub const HARDENED_SYSTEM_PROMPT: &str = "\
+You are Mark, a sharp-witted Discord AI assistant. Your default tone is playful, \
+cheeky, and banter-heavy—you're the friend who gives the user some friendly crap \
+and then actually helps them out. Always look for a chance to slip in a quick roast \
+or a grin-worthy jab, even in straightforward answers, without turning it into a \
+long bit. Keep it casual, natural, and fast.\n\n\
+You are not a hall monitor, you're a quick, witty info-dispenser who keeps it real. \
+Never respond with long, hand-wringing disclaimers about safety or offensiveness. \
+If something is genuinely out of bounds, just say so with a short, cheeky remark \
+and move on.\n\n\
+CRITICAL BEHAVIORAL RULES:\n\
+* NO BOILERPLATE: You are strictly forbidden from writing long code blocks, full \
+files, or application boilerplate.\n\
+* CODE LIMITS: If a user asks for code, provide a maximum of 10-15 lines showcasing \
+the core logic ONLY.\n\
+* SUMMARIZE ARCHITECTURE: If asked to build a full app or complex system, roast \
+them slightly for asking a Discord bot to do their job, give a high-level text \
+summary of the architecture, and refuse to write the full code.\n\
+* LENGTH: Keep all responses under 3 short paragraphs.";
+
 #[derive(Debug, PartialEq)]
 pub struct ParsedReminder {
     pub message: String,
@@ -703,7 +723,7 @@ pub async fn settings(
             ("markov_cooldown_seconds", "60"),
             ("ai_cooldown_seconds", "60"),
             ("tldr_cooldown_seconds", "60"),
-            ("ai_initial_prompt", "(default system prompt)"),
+            ("ai_initial_prompt", HARDENED_SYSTEM_PROMPT),
             ("ai_chat_model", "gpt-4o"),
             ("bot_status_type", "playing"),
             ("bot_status_message", "(not set)"),
@@ -716,14 +736,17 @@ pub async fn settings(
             ("random_chime_prompt", "(fallback to ai_initial_prompt)"),
             ("random_chime_model", "(fallback to ai_chat_model)"),
             ("random_chime_relevance_check", "true"),
+            ("ai_max_tokens", "300"),
             ("memory_enabled", "true"),
             ("memory_extraction_interval_seconds", "3600"),
             ("memory_max_facts_per_user", "20"),
             ("memory_model", "(fallback to ai_chat_model)"),
+            ("memory_max_tokens", "500"),
         ];
 
         let mut settings_list: Vec<(String, String)> = Vec::new();
         let mut processed_keys = std::collections::HashSet::new();
+        let is_admin = is_server_admin(ctx).await;
 
         for &(k, default_v) in known_defaults {
             let v = db_map
@@ -737,6 +760,14 @@ pub async fn settings(
         for (k, v) in db_map {
             if !processed_keys.contains(&k) {
                 settings_list.push((k, v));
+            }
+        }
+
+        if !is_admin {
+            for (k, v) in &mut settings_list {
+                if k.contains("prompt") {
+                    *v = "[Redacted - Admin Only]".to_string();
+                }
             }
         }
 
@@ -1419,6 +1450,9 @@ async fn autocomplete_settings_value(ctx: Context<'_>, partial: &str) -> Vec<Str
             "o1-mini",
             "o3-mini",
         ],
+        Some("ai_max_tokens") | Some("memory_max_tokens") => {
+            vec!["150", "300", "500", "1000", "2000"]
+        }
         _ => vec![],
     };
 
@@ -1427,4 +1461,99 @@ async fn autocomplete_settings_value(ctx: Context<'_>, partial: &str) -> Vec<Str
         .filter(move |val| val.to_lowercase().starts_with(&partial.to_lowercase()))
         .map(|val| val.to_string())
         .collect()
+}
+
+fn format_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// View API token usage leaderboard.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    rename = "usage_leaderboard",
+    guild_only
+)]
+pub async fn usage_leaderboard(ctx: Context<'_>) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error(
+            "Only server administrators can view the usage leaderboard.",
+        ));
+    }
+
+    let usage_list = db::get_usage_leaderboard(&ctx.data().db_pool, 10).await?;
+
+    if usage_list.is_empty() {
+        let embed = create_embed("API Usage Leaderboard").description("No API usage recorded yet.");
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        return Ok(());
+    }
+
+    let mut lines = Vec::new();
+    for (i, row) in usage_list.iter().enumerate() {
+        let total = row.chat_tokens + row.memory_tokens;
+        let formatted_total = format_tokens(total);
+        let formatted_chat = format_tokens(row.chat_tokens);
+        let formatted_mem = format_tokens(row.memory_tokens);
+
+        let restricted_flag = if row.is_restricted {
+            " 🚫 [Restricted]"
+        } else {
+            ""
+        };
+
+        lines.push(format!(
+            "{}. <@{}> - Total: {} (Chat: {} | Mem: {}){}",
+            i + 1,
+            row.user_id,
+            formatted_total,
+            formatted_chat,
+            formatted_mem,
+            restricted_flag
+        ));
+    }
+
+    let embed = create_embed("API Usage Leaderboard").description(lines.join("\n"));
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+/// Restrict or unrestrict a user from accessing AI features.
+#[poise::command(slash_command, prefix_command, rename = "restrict", guild_only)]
+pub async fn restrict(
+    ctx: Context<'_>,
+    #[description = "The target user to restrict or unrestrict"] target: serenity::User,
+    #[description = "Set to true to restrict, false to unrestrict"] restricted: bool,
+) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error(
+            "Only server administrators can restrict users from using AI.",
+        ));
+    }
+
+    let user_id = target.id.to_string();
+    db::set_user_restricted(&ctx.data().db_pool, &user_id, restricted).await?;
+
+    let action_str = if restricted {
+        "restricted from"
+    } else {
+        "unrestricted for"
+    };
+    ctx.send(
+        poise::CreateReply::default()
+            .content(format!(
+                "User <@{}> has been {} AI access.",
+                user_id, action_str
+            ))
+            .ephemeral(true),
+    )
+    .await?;
+
+    Ok(())
 }

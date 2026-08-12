@@ -177,3 +177,76 @@ pub async fn is_opted_out(pool: &SqlitePool, discord_id: &str) -> bool {
         .map(|(v,)| v)
         .unwrap_or(false)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ApiUsage {
+    pub user_id: String,
+    pub chat_tokens: i64,
+    pub memory_tokens: i64,
+    pub is_restricted: bool,
+}
+
+pub async fn is_user_restricted(pool: &SqlitePool, user_id: &str) -> bool {
+    sqlx::query_as::<_, (bool,)>("SELECT is_restricted FROM api_usage WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|(v,)| v)
+        .unwrap_or(false)
+}
+
+pub async fn record_chat_tokens(pool: &SqlitePool, user_id: &str, tokens: u32) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO api_usage (user_id, chat_tokens, is_restricted) VALUES (?, ?, false) \
+         ON CONFLICT(user_id) DO UPDATE SET chat_tokens = chat_tokens + excluded.chat_tokens",
+    )
+    .bind(user_id)
+    .bind(tokens as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn record_memory_tokens(
+    pool: &SqlitePool,
+    user_id: &str,
+    tokens: u32,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO api_usage (user_id, memory_tokens, is_restricted) VALUES (?, ?, false) \
+         ON CONFLICT(user_id) DO UPDATE SET memory_tokens = memory_tokens + excluded.memory_tokens",
+    )
+    .bind(user_id)
+    .bind(tokens as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_user_restricted(
+    pool: &SqlitePool,
+    user_id: &str,
+    restricted: bool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO api_usage (user_id, is_restricted) VALUES (?, ?) \
+         ON CONFLICT(user_id) DO UPDATE SET is_restricted = excluded.is_restricted",
+    )
+    .bind(user_id)
+    .bind(restricted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_usage_leaderboard(pool: &SqlitePool, limit: u32) -> sqlx::Result<Vec<ApiUsage>> {
+    sqlx::query_as::<_, ApiUsage>(
+        "SELECT user_id, chat_tokens, memory_tokens, is_restricted FROM api_usage \
+         ORDER BY (chat_tokens + memory_tokens) DESC LIMIT ?",
+    )
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}

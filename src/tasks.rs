@@ -130,8 +130,25 @@ async fn extract_memory(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(20);
 
+    let memory_max_tokens = db::get_setting(pool, "memory_max_tokens")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(500);
+
     let request = memory::build_extraction_messages(&participants, &transcript);
-    let response = openai.create_chat(&model, request).await?;
+    let response = openai
+        .create_chat_with_max_tokens(&model, request, Some(memory_max_tokens))
+        .await?;
+
+    if let Some(usage) = &response.usage {
+        if !participants.is_empty() {
+            let tokens_per_user = usage.total_tokens / (participants.len() as u32);
+            for (user_id, _) in &participants {
+                let _ = db::record_memory_tokens(pool, user_id, tokens_per_user).await;
+            }
+        }
+    }
+
     let Some(choice) = response.choices.first() else {
         return Ok(());
     };

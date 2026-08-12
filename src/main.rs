@@ -63,6 +63,13 @@ async fn event_handler(
             .unwrap_or(false);
 
         if mentioned || replied {
+            if db::is_user_restricted(&data.db_pool, &author_id_str).await {
+                let _ = new_message
+                    .reply(ctx, "❌ You have been restricted from using the AI.")
+                    .await;
+                return Ok(());
+            }
+
             let cooldown_secs: u64 = {
                 let cache = data.settings_cache.read().await;
                 cache
@@ -91,11 +98,11 @@ async fn event_handler(
                     cache
                         .get("ai_initial_prompt")
                         .cloned()
-                        .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+                        .unwrap_or_else(|| commands::HARDENED_SYSTEM_PROMPT.to_string()),
                     cache
                         .get("ai_chat_model")
                         .cloned()
-                        .unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+                        .unwrap_or_else(|| "gpt-4o".to_string()),
                 )
             };
 
@@ -229,8 +236,28 @@ async fn event_handler(
             let _ = new_message.react(ctx, thinking_reaction.clone()).await;
             let _typing = new_message.channel_id.start_typing(&ctx.http);
 
-            match data.openai_client.create_chat(&chat_model, messages).await {
+            let max_tokens: u32 = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_max_tokens")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300)
+            };
+
+            match data
+                .openai_client
+                .create_chat_with_max_tokens(&chat_model, messages, Some(max_tokens))
+                .await
+            {
                 Ok(response) => {
+                    if let Some(usage) = &response.usage {
+                        let _ = db::record_chat_tokens(
+                            &data.db_pool,
+                            &author_id_str,
+                            usage.total_tokens,
+                        )
+                        .await;
+                    }
                     if let Some(choice) = response.choices.first() {
                         let content = &choice.message.content;
                         if content.is_empty() {
@@ -411,6 +438,8 @@ async fn main() {
                 commands::status(),
                 commands::help(),
                 commands::register(),
+                commands::usage_leaderboard(),
+                commands::restrict(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))

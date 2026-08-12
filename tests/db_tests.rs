@@ -211,3 +211,60 @@ async fn test_opt_out_toggle_and_default() {
     db::set_opt_out(&pool, uid, false).await.unwrap();
     assert!(!db::is_opted_out(&pool, uid).await);
 }
+
+#[tokio::test]
+async fn test_db_api_usage_tracking() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "1001";
+
+    // Initial state: not restricted
+    assert!(!db::is_user_restricted(&pool, uid).await);
+
+    // Record chat tokens
+    db::record_chat_tokens(&pool, uid, 150).await.unwrap();
+    db::record_chat_tokens(&pool, uid, 50).await.unwrap();
+
+    // Record memory tokens
+    db::record_memory_tokens(&pool, uid, 100).await.unwrap();
+
+    let leaderboard = db::get_usage_leaderboard(&pool, 10).await.unwrap();
+    assert_eq!(leaderboard.len(), 1);
+    assert_eq!(leaderboard[0].user_id, uid);
+    assert_eq!(leaderboard[0].chat_tokens, 200);
+    assert_eq!(leaderboard[0].memory_tokens, 100);
+    assert_eq!(
+        leaderboard[0].chat_tokens + leaderboard[0].memory_tokens,
+        300
+    );
+}
+
+#[tokio::test]
+async fn test_db_user_restriction() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "1002";
+
+    assert!(!db::is_user_restricted(&pool, uid).await);
+
+    db::set_user_restricted(&pool, uid, true).await.unwrap();
+    assert!(db::is_user_restricted(&pool, uid).await);
+
+    db::set_user_restricted(&pool, uid, false).await.unwrap();
+    assert!(!db::is_user_restricted(&pool, uid).await);
+}
+
+#[tokio::test]
+async fn test_db_usage_leaderboard() {
+    let (pool, _temp) = setup_test_db().await;
+
+    db::record_chat_tokens(&pool, "userA", 100).await.unwrap();
+    db::record_memory_tokens(&pool, "userA", 50).await.unwrap(); // Total 150
+
+    db::record_chat_tokens(&pool, "userB", 500).await.unwrap(); // Total 500
+
+    db::record_memory_tokens(&pool, "userC", 50).await.unwrap(); // Total 50
+
+    let leaderboard = db::get_usage_leaderboard(&pool, 2).await.unwrap();
+    assert_eq!(leaderboard.len(), 2);
+    assert_eq!(leaderboard[0].user_id, "userB");
+    assert_eq!(leaderboard[1].user_id, "userA");
+}

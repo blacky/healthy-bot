@@ -84,11 +84,21 @@ pub struct ChatMessage {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChatUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub choices: Vec<ChatChoice>,
+    pub usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +153,16 @@ impl OpenAIClient {
         model: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<ChatResponse, crate::Error> {
+        self.create_chat_with_max_tokens(model, messages, None)
+            .await
+    }
+
+    pub async fn create_chat_with_max_tokens(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, crate::Error> {
         let response = self
             .client
             .post("https://api.openai.com/v1/chat/completions")
@@ -150,6 +170,7 @@ impl OpenAIClient {
             .json(&ChatRequest {
                 model: model.to_string(),
                 messages,
+                max_tokens,
             })
             .send()
             .await?;

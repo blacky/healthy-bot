@@ -27,3 +27,46 @@ fn truncates_to_64_chars() {
     let long = "a".repeat(100);
     assert_eq!(sanitize_name(&long).chars().count(), 64);
 }
+
+#[test]
+fn test_chat_request_max_tokens_serialization() {
+    use healthy_bot::openai::ChatRequest;
+
+    let req = ChatRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![],
+        max_tokens: Some(300),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains("\"max_tokens\":300"));
+
+    let req_no_tokens = ChatRequest {
+        model: "gpt-4o".to_string(),
+        messages: vec![],
+        max_tokens: None,
+    };
+    let json_no_tokens = serde_json::to_string(&req_no_tokens).unwrap();
+    assert!(!json_no_tokens.contains("max_tokens"));
+}
+
+#[test]
+fn test_chat_response_usage_deserialization() {
+    use healthy_bot::openai::ChatResponse;
+
+    let raw = r#"{
+        "choices": [{"message": {"content": "Hello"}}],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30
+        }
+    }"#;
+
+    let resp: ChatResponse = serde_json::from_str(raw).unwrap();
+    assert_eq!(resp.choices.len(), 1);
+    assert_eq!(resp.choices[0].message.content, "Hello");
+    let usage = resp.usage.unwrap();
+    assert_eq!(usage.prompt_tokens, 10);
+    assert_eq!(usage.completion_tokens, 20);
+    assert_eq!(usage.total_tokens, 30);
+}
