@@ -85,7 +85,7 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -170,7 +170,7 @@ impl OpenAIClient {
             .json(&ChatRequest {
                 model: model.to_string(),
                 messages,
-                max_tokens,
+                max_completion_tokens: max_tokens,
             })
             .send()
             .await?;

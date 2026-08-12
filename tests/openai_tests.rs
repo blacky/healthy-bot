@@ -35,18 +35,18 @@ fn test_chat_request_max_tokens_serialization() {
     let req = ChatRequest {
         model: "gpt-4o".to_string(),
         messages: vec![],
-        max_tokens: Some(300),
+        max_completion_tokens: Some(300),
     };
     let json = serde_json::to_string(&req).unwrap();
-    assert!(json.contains("\"max_tokens\":300"));
+    assert!(json.contains("\"max_completion_tokens\":300"));
 
     let req_no_tokens = ChatRequest {
         model: "gpt-4o".to_string(),
         messages: vec![],
-        max_tokens: None,
+        max_completion_tokens: None,
     };
     let json_no_tokens = serde_json::to_string(&req_no_tokens).unwrap();
-    assert!(!json_no_tokens.contains("max_tokens"));
+    assert!(!json_no_tokens.contains("max_completion_tokens"));
 }
 
 #[test]
