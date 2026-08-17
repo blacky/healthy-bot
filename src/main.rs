@@ -247,7 +247,11 @@ async fn event_handler(
             let mut attempt_messages = messages.clone();
             let mut final_response = data
                 .openai_client
-                .create_chat_with_max_tokens(&chat_model, attempt_messages.clone(), Some(max_tokens))
+                .create_chat_with_max_tokens(
+                    &chat_model,
+                    attempt_messages.clone(),
+                    Some(max_tokens),
+                )
                 .await;
 
             // If the response ran out of tokens before generating output (or generated empty output),
@@ -271,7 +275,11 @@ async fn event_handler(
                         });
                         if let Ok(retry_resp) = data
                             .openai_client
-                            .create_chat_with_max_tokens(&chat_model, attempt_messages, Some(max_tokens))
+                            .create_chat_with_max_tokens(
+                                &chat_model,
+                                attempt_messages,
+                                Some(max_tokens),
+                            )
                             .await
                         {
                             final_response = Ok(retry_resp);
@@ -294,7 +302,11 @@ async fn event_handler(
                         let content = choice.message.content_text();
                         if content.is_empty() {
                             if let Some(refusal) = &choice.message.refusal {
-                                log::warn!("OpenAI refusal for {}: {}", new_message.author.name, refusal);
+                                log::warn!(
+                                    "OpenAI refusal for {}: {}",
+                                    new_message.author.name,
+                                    refusal
+                                );
                                 let _ = new_message
                                     .reply(ctx, format!("OpenAI declined to respond: {}", refusal))
                                     .await;
