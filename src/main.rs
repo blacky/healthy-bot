@@ -244,11 +244,43 @@ async fn event_handler(
                     .unwrap_or(300)
             };
 
-            match data
+            let mut attempt_messages = messages.clone();
+            let mut final_response = data
                 .openai_client
-                .create_chat_with_max_tokens(&chat_model, messages, Some(max_tokens))
-                .await
-            {
+                .create_chat_with_max_tokens(&chat_model, attempt_messages.clone(), Some(max_tokens))
+                .await;
+
+            // If the response ran out of tokens before generating output (or generated empty output),
+            // attempt 1 retry with an explicit brevity directive.
+            if let Ok(ref resp) = final_response {
+                if let Some(choice) = resp.choices.first() {
+                    if choice.message.content_text().is_empty()
+                        && choice.finish_reason.as_deref() == Some("length")
+                    {
+                        log::info!(
+                            "OpenAI hit token limit ({} tokens) for {}, attempting auto-retry with brevity directive...",
+                            max_tokens,
+                            new_message.author.name
+                        );
+                        attempt_messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            name: None,
+                            content: ChatMessageRequestContent::Text(
+                                "CRITICAL INSTRUCTION: Your previous attempt ran out of tokens. Give a concise response in 1-2 short paragraphs max to stay strictly under the token limit.".to_string(),
+                            ),
+                        });
+                        if let Ok(retry_resp) = data
+                            .openai_client
+                            .create_chat_with_max_tokens(&chat_model, attempt_messages, Some(max_tokens))
+                            .await
+                        {
+                            final_response = Ok(retry_resp);
+                        }
+                    }
+                }
+            }
+
+            match final_response {
                 Ok(response) => {
                     if let Some(usage) = &response.usage {
                         let _ = db::record_chat_tokens(
@@ -259,28 +291,64 @@ async fn event_handler(
                         .await;
                     }
                     if let Some(choice) = response.choices.first() {
-                        let content = &choice.message.content;
+                        let content = choice.message.content_text();
                         if content.is_empty() {
-                            let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
-                        } else if content.len() <= 2000 {
-                            // Discord 2000 char limit handling
-                            let _ = new_message.reply(ctx, content).await;
-                            log::info!("OpenAI replied to {}", new_message.author.name);
-                        } else {
-                            log::info!(
-                                "OpenAI response too long ({} chars), splitting...",
-                                content.len()
-                            );
-                            let mut last_sent: Option<serenity::Message> = None;
-                            for chunk in split_message(content, 2000) {
-                                let sent = if let Some(ref prev) = last_sent {
-                                    prev.reply(ctx, chunk).await.ok()
-                                } else {
-                                    new_message.reply(ctx, chunk).await.ok()
-                                };
-                                last_sent = sent;
+                            if let Some(refusal) = &choice.message.refusal {
+                                log::warn!("OpenAI refusal for {}: {}", new_message.author.name, refusal);
+                                let _ = new_message
+                                    .reply(ctx, format!("OpenAI declined to respond: {}", refusal))
+                                    .await;
+                            } else if choice.finish_reason.as_deref() == Some("length") {
+                                log::warn!(
+                                    "OpenAI response reached max token limit (max_tokens: {}) for {}",
+                                    max_tokens,
+                                    new_message.author.name
+                                );
+                                let _ = new_message
+                                    .reply(
+                                        ctx,
+                                        format!(
+                                            "OpenAI response reached the token limit ({} tokens) before completing.",
+                                            max_tokens
+                                        ),
+                                    )
+                                    .await;
+                            } else {
+                                log::warn!(
+                                    "OpenAI returned empty response for {} (finish_reason: {:?})",
+                                    new_message.author.name,
+                                    choice.finish_reason
+                                );
+                                let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
                             }
-                            log::info!("OpenAI replied to {}", new_message.author.name);
+                        } else {
+                            if choice.finish_reason.as_deref() == Some("length") {
+                                log::warn!(
+                                    "OpenAI response was truncated at token limit (max_tokens: {}) for {}",
+                                    max_tokens,
+                                    new_message.author.name
+                                );
+                            }
+                            if content.len() <= 2000 {
+                                // Discord 2000 char limit handling
+                                let _ = new_message.reply(ctx, content).await;
+                                log::info!("OpenAI replied to {}", new_message.author.name);
+                            } else {
+                                log::info!(
+                                    "OpenAI response too long ({} chars), splitting...",
+                                    content.len()
+                                );
+                                let mut last_sent: Option<serenity::Message> = None;
+                                for chunk in split_message(content, 2000) {
+                                    let sent = if let Some(ref prev) = last_sent {
+                                        prev.reply(ctx, chunk).await.ok()
+                                    } else {
+                                        new_message.reply(ctx, chunk).await.ok()
+                                    };
+                                    last_sent = sent;
+                                }
+                                log::info!("OpenAI replied to {}", new_message.author.name);
+                            }
                         }
                     }
                 }
@@ -807,7 +875,7 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
             Ok(resp) => resp
                 .choices
                 .first()
-                .map(|c| chime::is_affirmative(&c.message.content))
+                .map(|c| chime::is_affirmative(c.message.content_text()))
                 .unwrap_or(false),
             Err(e) => {
                 log::error!("Random chime: relevance check failed: {:?}", e);
@@ -840,7 +908,7 @@ async fn try_random_chime(ctx: &serenity::Context, data: &Data, new_message: &se
     match data.openai_client.create_chat(&chat_model, messages).await {
         Ok(response) => {
             if let Some(choice) = response.choices.first() {
-                let content = choice.message.content.trim();
+                let content = choice.message.content_text().trim();
                 if !content.is_empty() {
                     // Post as a standalone message (no reply-ping) so it reads as
                     // casually joining in. Chimes are meant to be short; truncate

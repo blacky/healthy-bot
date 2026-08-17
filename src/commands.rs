@@ -540,7 +540,7 @@ pub async fn tldr(
     let summary = response
         .choices
         .first()
-        .map(|c| c.message.content.clone())
+        .map(|c| c.message.content_text().to_string())
         .unwrap_or_default();
 
     if summary.trim().is_empty() {

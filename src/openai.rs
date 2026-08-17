@@ -101,14 +101,26 @@ pub struct ChatResponse {
     pub usage: Option<ChatUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ChatChoice {
     pub message: ChatMessageContent,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ChatMessageContent {
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+impl ChatMessageContent {
+    /// Returns the text content if present and non-empty, otherwise `""`.
+    pub fn content_text(&self) -> &str {
+        self.content.as_deref().unwrap_or("")
+    }
 }
 
 #[derive(Debug, Serialize)]

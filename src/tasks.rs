@@ -153,7 +153,7 @@ async fn extract_memory(
         return Ok(());
     };
 
-    let facts = memory::parse_extracted_facts(&choice.message.content);
+    let facts = memory::parse_extracted_facts(choice.message.content_text());
     if facts.is_empty() {
         return Ok(());
     }
