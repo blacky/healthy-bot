@@ -19,6 +19,11 @@ async fn event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<(), Error> {
+    if let serenity::FullEvent::ThreadDelete { thread, .. } = event {
+        data.active_ai_threads.write().await.remove(&thread.id);
+        return Ok(());
+    }
+
     if let serenity::FullEvent::Message { new_message } = event {
         let is_allowed_bot = if new_message.author.bot {
             let cache = data.settings_cache.read().await;
@@ -59,7 +64,50 @@ async fn event_handler(
             .map(|m| m.author.id == self_id)
             .unwrap_or(false);
 
-        if mentioned || replied {
+        // Threads act like a standing conversation with the bot: once triggered
+        // (via @mention or a reply, below) every later message in that thread is
+        // answered too, without needing another mention.
+        let is_thread_channel = new_message
+            .guild_id
+            .and_then(|gid| {
+                ctx.cache.guild(gid).and_then(|g| {
+                    g.channels
+                        .get(&new_message.channel_id)
+                        .map(|c| c.kind)
+                        .or_else(|| {
+                            g.threads
+                                .iter()
+                                .find(|t| t.id == new_message.channel_id)
+                                .map(|t| t.kind)
+                        })
+                })
+            })
+            .map(|kind| {
+                matches!(
+                    kind,
+                    serenity::ChannelType::PublicThread
+                        | serenity::ChannelType::PrivateThread
+                        | serenity::ChannelType::NewsThread
+                )
+            })
+            .unwrap_or(false);
+        let in_active_thread = if is_thread_channel {
+            data.active_ai_threads
+                .read()
+                .await
+                .contains(&new_message.channel_id)
+        } else {
+            false
+        };
+
+        if mentioned || replied || in_active_thread {
+            if is_thread_channel {
+                data.active_ai_threads
+                    .write()
+                    .await
+                    .insert(new_message.channel_id);
+            }
+
             let cooldown_secs: u64 = {
                 let cache = data.settings_cache.read().await;
                 cache
@@ -107,21 +155,66 @@ async fn event_handler(
                     || model_lower.contains("o3")
             };
 
-            // Build conversation context by walking up the reply chain. Discord
-            // only includes the immediate parent inline (`referenced_message`);
-            // deeper ancestors come back with an empty `referenced_message`, so
-            // each one must be fetched explicitly via its `message_reference`
-            // pointer. Capped at 10 hops for token/rate-limit safety.
-            let mut messages = Vec::new();
-            let mut parent = new_message.referenced_message.as_deref().cloned();
-            for hop in 0..10 {
-                let Some(msg) = parent else {
-                    break;
-                };
+            // Build conversation context. Threads are a flat, ChatGPT-style
+            // conversation, so pull recent thread history directly. Everywhere
+            // else, walk up the reply chain: Discord only includes the immediate
+            // parent inline (`referenced_message`); deeper ancestors come back
+            // with an empty `referenced_message`, so each one must be fetched
+            // explicitly via its `message_reference` pointer. Both are capped at
+            // 10 messages for token/rate-limit safety.
+            let mut messages = if is_thread_channel {
+                build_thread_history_messages(
+                    ctx,
+                    &data.openai_client.client,
+                    new_message.channel_id,
+                    new_message.id,
+                    bot_id,
+                )
+                .await
+            } else {
+                let mut messages = Vec::new();
+                let mut parent = new_message.referenced_message.as_deref().cloned();
+                for hop in 0..10 {
+                    let Some(msg) = parent else {
+                        break;
+                    };
 
-                let content_trimmed = msg.content.trim();
-                if content_trimmed.is_empty() && msg.attachments.is_empty() {
-                    // Fetch parent to keep traversing, but don't add empty message to vector
+                    let content_trimmed = msg.content.trim();
+                    if content_trimmed.is_empty() && msg.attachments.is_empty() {
+                        // Fetch parent to keep traversing, but don't add empty message to vector
+                        parent = match &msg.message_reference {
+                            Some(reference) => match reference.message_id {
+                                Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
+                                None => None,
+                            },
+                            None => None,
+                        };
+                        continue;
+                    }
+
+                    let role = if msg.author.id == bot_id {
+                        "assistant"
+                    } else {
+                        "user"
+                    };
+
+                    // Strip images from older ancestors (hop >= 1) to save tokens and costs; only keep for the immediate parent (hop == 0)
+                    let include_images = supports_vision && hop == 0;
+                    let content_payload = build_message_content(
+                        &data.openai_client.client,
+                        content_trimmed,
+                        &msg.attachments,
+                        include_images,
+                    )
+                    .await;
+
+                    messages.push(ChatMessage {
+                        role: role.to_string(),
+                        name: Some(sanitize_name(&msg.author.name)),
+                        content: content_payload,
+                    });
+
+                    // Fetch this message's own parent (the gateway didn't include it).
                     parent = match &msg.message_reference {
                         Some(reference) => match reference.message_id {
                             Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
@@ -129,40 +222,9 @@ async fn event_handler(
                         },
                         None => None,
                     };
-                    continue;
                 }
-
-                let role = if msg.author.id == bot_id {
-                    "assistant"
-                } else {
-                    "user"
-                };
-
-                // Strip images from older ancestors (hop >= 1) to save tokens and costs; only keep for the immediate parent (hop == 0)
-                let include_images = supports_vision && hop == 0;
-                let content_payload = build_message_content(
-                    &data.openai_client.client,
-                    content_trimmed,
-                    &msg.attachments,
-                    include_images,
-                )
-                .await;
-
-                messages.push(ChatMessage {
-                    role: role.to_string(),
-                    name: Some(sanitize_name(&msg.author.name)),
-                    content: content_payload,
-                });
-
-                // Fetch this message's own parent (the gateway didn't include it).
-                parent = match &msg.message_reference {
-                    Some(reference) => match reference.message_id {
-                        Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
-                        None => None,
-                    },
-                    None => None,
-                };
-            }
+                messages
+            };
             messages.reverse(); // Reverse the history to be in chronological order
 
             // Add the system prompt at the very beginning
@@ -360,6 +422,7 @@ async fn main() {
             std::time::Instant::now() - std::time::Duration::from_secs(3600),
         ),
         settings_cache: settings_cache.clone(),
+        active_ai_threads: RwLock::new(std::collections::HashSet::new()),
     };
 
     let framework = poise::Framework::builder()
@@ -567,6 +630,59 @@ async fn main() {
     if let Err(why) = client.start().await {
         log::error!("Client error: {:?}", why);
     }
+}
+
+/// Pull recent message history directly from a thread channel, newest-first,
+/// to use as conversation context. Unlike the reply-chain walk, thread messages
+/// aren't necessarily linked via `referenced_message`, so history must come
+/// from the channel itself.
+async fn build_thread_history_messages(
+    ctx: &serenity::Context,
+    openai_client: &reqwest::Client,
+    channel_id: serenity::ChannelId,
+    before: serenity::MessageId,
+    bot_id: serenity::UserId,
+) -> Vec<ChatMessage> {
+    const HISTORY_LIMIT: u8 = 10;
+    let fetched = channel_id
+        .messages(
+            ctx,
+            serenity::GetMessages::new()
+                .before(before)
+                .limit(HISTORY_LIMIT),
+        )
+        .await
+        .unwrap_or_default();
+
+    let mut messages = Vec::new();
+    for msg in fetched.iter() {
+        let content_trimmed = msg.content.trim();
+        if content_trimmed.is_empty() && msg.attachments.is_empty() {
+            continue;
+        }
+        // Ignore other bots' chatter; only this bot's own replies count as history.
+        if msg.author.bot && msg.author.id != bot_id {
+            continue;
+        }
+
+        let role = if msg.author.id == bot_id {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        // Images aren't fetched for older thread history to save tokens/cost;
+        // only the triggering message itself gets vision treatment.
+        let content_payload =
+            build_message_content(openai_client, content_trimmed, &msg.attachments, false).await;
+
+        messages.push(ChatMessage {
+            role: role.to_string(),
+            name: Some(sanitize_name(&msg.author.name)),
+            content: content_payload,
+        });
+    }
+    messages
 }
 
 async fn build_message_content(

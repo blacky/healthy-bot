@@ -6,8 +6,9 @@ pub mod tasks;
 
 use crate::markov::MarkovRepository;
 use crate::openai::OpenAIClient;
+use serenity::all::ChannelId;
 use sqlx::sqlite::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -19,6 +20,10 @@ pub struct Data {
     pub last_markov: tokio::sync::Mutex<std::time::Instant>,
     pub last_openai: tokio::sync::Mutex<std::time::Instant>,
     pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
+    /// Threads the bot is actively chatting in: once a thread's conversation is
+    /// kicked off (via @mention or a reply), every subsequent message in that
+    /// thread is treated as a continuation, without needing another mention.
+    pub active_ai_threads: RwLock<HashSet<ChannelId>>,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
