@@ -148,6 +148,31 @@ pub async fn delete_fact(pool: &SqlitePool, discord_id: &str, fact_id: i64) -> b
         .unwrap_or(false)
 }
 
+/// Delete multiple facts owned by `discord_id`. Returns how many rows were removed.
+pub async fn delete_facts_by_ids(
+    pool: &SqlitePool,
+    discord_id: &str,
+    fact_ids: &[i64],
+) -> sqlx::Result<u64> {
+    if fact_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut query = String::from("DELETE FROM user_fact WHERE discord_id = ? AND id IN (");
+    for (i, _) in fact_ids.iter().enumerate() {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push('?');
+    }
+    query.push(')');
+    let mut q = sqlx::query(&query).bind(discord_id);
+    for &id in fact_ids {
+        q = q.bind(id);
+    }
+    let res = q.execute(pool).await?;
+    Ok(res.rows_affected())
+}
+
 /// Delete all of a user's facts, returning how many were removed.
 pub async fn clear_facts(pool: &SqlitePool, discord_id: &str) -> sqlx::Result<u64> {
     let r = sqlx::query("DELETE FROM user_fact WHERE discord_id = ?")

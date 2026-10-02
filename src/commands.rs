@@ -1,4 +1,5 @@
 use crate::db;
+use crate::memory;
 use crate::openai::{ChatMessage, ChatMessageRequestContent};
 use crate::recent;
 use crate::split_message;
@@ -1210,11 +1211,13 @@ async fn reply_facts(ctx: Context<'_>, discord_id: &str, self_view: bool) -> Res
     prefix_command,
     subcommands(
         "memory_view",
-        "memory_forget",
+        "memory_forget_slash",
+        "memory_forget_prefix",
         "memory_clear",
         "memory_optout",
         "memory_optin",
-        "memory_insert"
+        "memory_insert",
+        "memory_add"
     )
 )]
 pub async fn memory(ctx: Context<'_>) -> Result<(), Error> {
@@ -1240,48 +1243,153 @@ pub async fn memory_view(
     }
 }
 
-/// Forget one of your facts by number, or all of them
-#[poise::command(slash_command, prefix_command, rename = "forget")]
-pub async fn memory_forget(
+async fn execute_forget(
     ctx: Context<'_>,
-    #[rest]
-    #[description = "'all', or the number of a fact from `view`"]
-    target: Option<String>,
+    target_user_id: &str,
+    target_user_name: &str,
+    target_is_self: bool,
+    target_spec: &str,
 ) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
-    let user_id = ctx.author().id.to_string();
-    let target = target.unwrap_or_default();
-    let target = target.trim();
+    let target_spec = target_spec.trim();
 
-    if target.eq_ignore_ascii_case("all") {
-        let n = db::clear_facts(pool, &user_id).await?;
-        ctx.say(format!("Cleared {} memory item(s).", n)).await?;
+    if target_spec.eq_ignore_ascii_case("all") {
+        let n = db::clear_facts(pool, target_user_id).await?;
+        let msg = if target_is_self {
+            format!("Cleared {} memory item(s).", n)
+        } else {
+            format!("Cleared {} memory item(s) for {}.", n, target_user_name)
+        };
+        ctx.send(
+            poise::CreateReply::default()
+                .content(msg)
+                .ephemeral(true)
+                .allowed_mentions(serenity::builder::CreateAllowedMentions::new().empty_users()),
+        )
+        .await?;
         return Ok(());
     }
 
-    let idx: usize = target
-        .parse()
-        .map_err(|_| user_error("Usage: `forget <number>` (from `view`) or `forget all`."))?;
-    if idx == 0 {
-        return Err(user_error("Numbers start at 1. Use `view` to see them."));
+    let facts = db::get_facts(pool, target_user_id).await;
+    if facts.is_empty() {
+        let msg = if target_is_self {
+            "You have no memories stored."
+        } else {
+            "This user has no memories stored."
+        };
+        return Err(user_error(msg));
     }
 
-    let facts = db::get_facts(pool, &user_id).await;
-    let Some(fact) = facts.get(idx - 1) else {
-        return Err(user_error(format!(
-            "You only have {} memory item(s).",
-            facts.len()
-        )));
+    let indices = memory::parse_fact_indices(target_spec, facts.len()).map_err(user_error)?;
+
+    let to_delete: Vec<&db::UserFact> = indices.iter().map(|&idx| &facts[idx - 1]).collect();
+    let ids: Vec<i64> = to_delete.iter().map(|f| f.id).collect();
+    let fact_texts: Vec<String> = to_delete.iter().map(|f| f.fact.clone()).collect();
+
+    let _ = db::delete_facts_by_ids(pool, target_user_id, &ids).await?;
+
+    let msg = if target_is_self {
+        if fact_texts.len() == 1 {
+            format!("Forgot: {}", fact_texts[0])
+        } else {
+            let list = fact_texts
+                .iter()
+                .map(|t| format!("• {}", t))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Forgot {} items:\n{}", fact_texts.len(), list)
+        }
+    } else {
+        if fact_texts.len() == 1 {
+            format!("Forgot for {}: \"{}\"", target_user_name, fact_texts[0])
+        } else {
+            let list = fact_texts
+                .iter()
+                .map(|t| format!("• {}", t))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Forgot {} item(s) for {}:\n{}",
+                fact_texts.len(),
+                target_user_name,
+                list
+            )
+        }
     };
 
-    if db::delete_fact(pool, &user_id, fact.id).await {
-        ctx.say(format!("Forgot: {}", fact.fact)).await?;
-        Ok(())
-    } else {
-        Err(user_error(
-            "Could not delete that item; it may already be gone.",
-        ))
+    ctx.send(
+        poise::CreateReply::default()
+            .content(msg)
+            .ephemeral(true)
+            .allowed_mentions(serenity::builder::CreateAllowedMentions::new().empty_users()),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Forget stored facts by number (e.g. 1, 1 2, 2-4), or all of them
+#[poise::command(slash_command, rename = "forget")]
+pub async fn memory_forget_slash(
+    ctx: Context<'_>,
+    #[description = "'all', or numbers from view (e.g. '1', '1, 2', '2-4')"] target: String,
+    #[description = "User whose facts to forget (admin only)"] user: Option<serenity::User>,
+) -> Result<(), Error> {
+    let (target_id, target_name, target_is_self) = match user {
+        Some(u) => {
+            if !is_user_admin(ctx).await {
+                return Err(user_error(
+                    "You are not authorized to forget others' memories.",
+                ));
+            }
+            let is_self = u.id == ctx.author().id;
+            (u.id.to_string(), u.name, is_self)
+        }
+        None => (ctx.author().id.to_string(), ctx.author().name.clone(), true),
+    };
+
+    execute_forget(ctx, &target_id, &target_name, target_is_self, &target).await
+}
+
+/// Forget stored facts by number (e.g. 1, 1 2, 2-4), or all of them
+#[poise::command(prefix_command, rename = "forget")]
+pub async fn memory_forget_prefix(
+    ctx: Context<'_>,
+    #[rest]
+    #[description = "'all', or numbers like '1', '1, 2', '1 2 3', optionally with user if admin"]
+    input: Option<String>,
+) -> Result<(), Error> {
+    let raw = input.unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(user_error(
+            "Usage: `forget <number(s)>` (e.g. `forget 1` or `forget 1, 2`) or `forget all`.",
+        ));
     }
+
+    let is_admin = is_user_admin(ctx).await;
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+
+    // Check if the first or last token is a user specification (admin only)
+    if is_admin && tokens.len() >= 2 {
+        // Try first token as user
+        if let Ok((uid, name)) = resolve_user(ctx, tokens[0]).await {
+            let spec = tokens[1..].join(" ");
+            let is_self = uid == ctx.author().id.to_string();
+            return execute_forget(ctx, &uid, &name, is_self, &spec).await;
+        }
+        // Try last token as user
+        let last_idx = tokens.len() - 1;
+        if let Ok((uid, name)) = resolve_user(ctx, tokens[last_idx]).await {
+            let spec = tokens[..last_idx].join(" ");
+            let is_self = uid == ctx.author().id.to_string();
+            return execute_forget(ctx, &uid, &name, is_self, &spec).await;
+        }
+    }
+
+    let self_id = ctx.author().id.to_string();
+    let self_name = ctx.author().name.clone();
+    execute_forget(ctx, &self_id, &self_name, true, raw).await
 }
 
 /// Clear all of a user's stored facts (admin only)
@@ -1326,23 +1434,96 @@ pub async fn memory_optin(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn resolve_user(ctx: Context<'_>, query: &str) -> Result<(String, String), Error> {
+    let query = query.trim();
+    // 1. Check if it's a mention <@!12345> or <@12345>
+    if let Some(id_str) = query.strip_prefix("<@").and_then(|s| s.strip_suffix('>')) {
+        let id_str = id_str.strip_prefix('!').unwrap_or(id_str);
+        if let Ok(id_u64) = id_str.parse::<u64>() {
+            let user_id = serenity::UserId::new(id_u64);
+            if let Ok(u) = user_id.to_user(&ctx).await {
+                return Ok((u.id.to_string(), u.name));
+            }
+        }
+    }
+    // 2. Check if it's a numeric ID
+    if let Ok(id_u64) = query.parse::<u64>() {
+        let user_id = serenity::UserId::new(id_u64);
+        if let Ok(u) = user_id.to_user(&ctx).await {
+            return Ok((u.id.to_string(), u.name));
+        }
+    }
+    // 3. Search members in guild cache by username, global name, or nickname
+    if let Some(guild) = ctx.guild() {
+        let q_lower = query.to_lowercase();
+        for member in guild.members.values() {
+            let name_match = member.user.name.to_lowercase() == q_lower;
+            let nick_match = member
+                .nick
+                .as_deref()
+                .map(|n| n.to_lowercase() == q_lower)
+                .unwrap_or(false);
+            let global_match = member
+                .user
+                .global_name
+                .as_deref()
+                .map(|g| g.to_lowercase() == q_lower)
+                .unwrap_or(false);
+            if name_match || nick_match || global_match {
+                return Ok((member.user.id.to_string(), member.user.name.clone()));
+            }
+        }
+        for member in guild.members.values() {
+            let name_match = member.user.name.to_lowercase().contains(&q_lower);
+            let nick_match = member
+                .nick
+                .as_deref()
+                .map(|n| n.to_lowercase().contains(&q_lower))
+                .unwrap_or(false);
+            let global_match = member
+                .user
+                .global_name
+                .as_deref()
+                .map(|g| g.to_lowercase().contains(&q_lower))
+                .unwrap_or(false);
+            if name_match || nick_match || global_match {
+                return Ok((member.user.id.to_string(), member.user.name.clone()));
+            }
+        }
+    }
+    // 4. Search via HTTP
+    if let Some(guild_id) = ctx.guild_id() {
+        if let Ok(members) = guild_id.search_members(ctx.http(), query, Some(5)).await {
+            if let Some(m) = members.into_iter().next() {
+                return Ok((m.user.id.to_string(), m.user.name));
+            }
+        }
+    }
+
+    Err(user_error(format!(
+        "Could not find user matching '{}'.",
+        query
+    )))
+}
+
 async fn handle_memory_insert(
     ctx: Context<'_>,
-    user: serenity::User,
-    fact: String,
+    user_id: &str,
+    user_name: &str,
+    is_bot: bool,
+    fact: &str,
 ) -> Result<(), Error> {
     if !is_user_admin(ctx).await {
         return Err(user_error("Unauthorized"));
     }
-    if user.bot {
+    if is_bot {
         return Err(user_error("Cannot add memories for bot accounts."));
     }
 
     let pool = &ctx.data().db_pool;
-    let user_id = user.id.to_string();
 
-    if db::is_opted_out(pool, &user_id).await {
-        return Err(user_error(format!("{} is opted out of memory.", user.name)));
+    if db::is_opted_out(pool, user_id).await {
+        return Err(user_error(format!("{} is opted out of memory.", user_name)));
     }
 
     let fact_trimmed = fact.trim();
@@ -1354,19 +1535,19 @@ async fn handle_memory_insert(
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    db::create_user_if_not_exists(pool, &user_id).await?;
-    let inserted = db::add_fact(pool, &user_id, fact_trimmed, now_ms).await?;
+    db::create_user_if_not_exists(pool, user_id).await?;
+    let inserted = db::add_fact(pool, user_id, fact_trimmed, now_ms).await?;
 
     let max_facts = db::get_setting(pool, "memory_max_facts_per_user")
         .await
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(20);
-    let _ = db::prune_facts(pool, &user_id, max_facts).await;
+    let _ = db::prune_facts(pool, user_id, max_facts).await;
 
     let content = if inserted {
-        format!("Remembered for {}: \"{}\"", user.name, fact_trimmed)
+        format!("Remembered for {}: \"{}\"", user_name, fact_trimmed)
     } else {
-        format!("That fact is already remembered for {}.", user.name)
+        format!("That fact is already remembered for {}.", user_name)
     };
 
     ctx.send(
@@ -1381,34 +1562,58 @@ async fn handle_memory_insert(
 }
 
 /// Insert a fact for a user without notifying them (admin only)
-#[poise::command(prefix_command, hide_in_help, rename = "insert", aliases("add"))]
+#[poise::command(prefix_command, hide_in_help, rename = "insert")]
 pub async fn memory_insert(
     ctx: Context<'_>,
-    #[description = "The user to remember a fact about"] user: serenity::User,
+    #[description = "The user (name, nickname, mention, or ID)"] target: String,
     #[rest]
     #[description = "The fact to remember about the user"]
     fact: String,
 ) -> Result<(), Error> {
-    handle_memory_insert(ctx, user, fact).await
+    let (uid, name) = resolve_user(ctx, &target).await?;
+    let is_bot = ctx
+        .http()
+        .get_user(serenity::UserId::new(uid.parse().unwrap_or(0)))
+        .await
+        .map(|u| u.bot)
+        .unwrap_or(false);
+    handle_memory_insert(ctx, &uid, &name, is_bot, &fact).await
 }
 
-/// Insert a fact for a user without notifying them (admin only)
+/// Add a fact for a user without notifying them (admin only)
+#[poise::command(prefix_command, hide_in_help, rename = "add")]
+pub async fn memory_add(
+    ctx: Context<'_>,
+    #[description = "The user (name, nickname, mention, or ID)"] target: String,
+    #[rest]
+    #[description = "The fact to remember about the user"]
+    fact: String,
+) -> Result<(), Error> {
+    let (uid, name) = resolve_user(ctx, &target).await?;
+    let is_bot = ctx
+        .http()
+        .get_user(serenity::UserId::new(uid.parse().unwrap_or(0)))
+        .await
+        .map(|u| u.bot)
+        .unwrap_or(false);
+    handle_memory_insert(ctx, &uid, &name, is_bot, &fact).await
+}
+
+/// Remember a fact about a user without notifying them (admin only)
 #[poise::command(
     slash_command,
-    prefix_command,
     default_member_permissions = "ADMINISTRATOR",
     hide_in_help,
-    rename = "memory_insert",
-    aliases("memory_add")
+    rename = "remember"
 )]
-pub async fn memory_insert_cmd(
+pub async fn remember_cmd(
     ctx: Context<'_>,
     #[description = "The user to remember a fact about"] user: serenity::User,
     #[rest]
     #[description = "The fact to remember about the user"]
     fact: String,
 ) -> Result<(), Error> {
-    handle_memory_insert(ctx, user, fact).await
+    handle_memory_insert(ctx, &user.id.to_string(), &user.name, user.bot, &fact).await
 }
 
 /// Show help for all commands

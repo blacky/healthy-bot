@@ -1,6 +1,6 @@
 use healthy_bot::memory::{
     build_extraction_messages, filter_unscanned_message_ids, format_memory_context,
-    parse_extracted_facts,
+    parse_extracted_facts, parse_fact_indices,
 };
 
 #[test]
@@ -115,4 +115,24 @@ fn filter_unscanned_chat_has_new_messages() {
     let (new_ids, cursor) = filter_unscanned_message_ids(&ids, Some(300));
     assert_eq!(new_ids, vec![500, 400]);
     assert_eq!(cursor, Some(500));
+}
+
+#[test]
+fn parse_fact_indices_single_and_multiple() {
+    assert_eq!(parse_fact_indices("1", 5).unwrap(), vec![1]);
+    assert_eq!(parse_fact_indices("1, 2, 3", 5).unwrap(), vec![1, 2, 3]);
+    assert_eq!(parse_fact_indices("1 2 3", 5).unwrap(), vec![1, 2, 3]);
+    assert_eq!(parse_fact_indices("1,2,3", 5).unwrap(), vec![1, 2, 3]);
+    assert_eq!(parse_fact_indices("2-4", 5).unwrap(), vec![2, 3, 4]);
+    // Deduplication and ordering
+    assert_eq!(parse_fact_indices("3, 1, 3", 5).unwrap(), vec![1, 3]);
+}
+
+#[test]
+fn parse_fact_indices_errors() {
+    assert!(parse_fact_indices("", 5).is_err());
+    assert!(parse_fact_indices("0", 5).is_err());
+    assert!(parse_fact_indices("6", 5).is_err());
+    assert!(parse_fact_indices("abc", 5).is_err());
+    assert!(parse_fact_indices("4-2", 5).is_err());
 }

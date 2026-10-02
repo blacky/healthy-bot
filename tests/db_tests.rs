@@ -176,6 +176,31 @@ async fn test_delete_fact_is_scoped_to_owner() {
 }
 
 #[tokio::test]
+async fn test_delete_facts_by_ids() {
+    let (pool, _temp) = setup_test_db().await;
+    let uid = "111";
+    for i in 1..=5 {
+        db::add_fact(&pool, uid, &format!("fact {}", i), i)
+            .await
+            .unwrap();
+    }
+
+    let facts = db::get_facts(&pool, uid).await;
+    assert_eq!(facts.len(), 5);
+
+    // Delete fact 1 and fact 3
+    let ids = vec![facts[0].id, facts[2].id];
+    let removed = db::delete_facts_by_ids(&pool, uid, &ids).await.unwrap();
+    assert_eq!(removed, 2);
+
+    let remaining = db::get_facts(&pool, uid).await;
+    assert_eq!(remaining.len(), 3);
+    assert_eq!(remaining[0].fact, "fact 2");
+    assert_eq!(remaining[1].fact, "fact 4");
+    assert_eq!(remaining[2].fact, "fact 5");
+}
+
+#[tokio::test]
 async fn test_prune_keeps_newest() {
     let (pool, _temp) = setup_test_db().await;
     let uid = "111";

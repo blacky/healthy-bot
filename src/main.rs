@@ -514,7 +514,7 @@ async fn main() {
                 commands::settings(),
                 commands::user_cmd(),
                 commands::memory(),
-                commands::memory_insert_cmd(),
+                commands::remember_cmd(),
                 commands::inthards(),
                 commands::status(),
                 commands::help(),

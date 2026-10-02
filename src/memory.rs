@@ -133,3 +133,82 @@ pub fn filter_unscanned_message_ids(
         (message_ids.to_vec(), Some(newest_id))
     }
 }
+
+/// Parse fact indices from an input string like "1", "1, 2, 3", "1 2 3", "2-4".
+/// Deduplicates numbers and keeps them in sorted order.
+/// Validates that all indices are >= 1 and <= `max_facts`.
+/// Returns Ok(Vec<usize>) (1-based indices), or Err(user-facing error message).
+pub fn parse_fact_indices(input: &str, max_facts: usize) -> Result<Vec<usize>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "Please specify which memory number(s) to forget (e.g. `forget 1` or `forget 1, 2`)."
+                .to_string(),
+        );
+    }
+
+    let normalized = trimmed.replace(',', " ");
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(
+            "Please specify which memory number(s) to forget (e.g. `forget 1` or `forget 1, 2`)."
+                .to_string(),
+        );
+    }
+
+    let mut indices: Vec<usize> = Vec::new();
+
+    for token in tokens {
+        if let Some((start_str, end_str)) = token.split_once('-') {
+            if !start_str.is_empty() && !end_str.is_empty() {
+                let start = start_str
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid number '{}' in range.", start_str))?;
+                let end = end_str
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid number '{}' in range.", end_str))?;
+                if start == 0 || end == 0 {
+                    return Err("Numbers start at 1. Use `view` to see them.".to_string());
+                }
+                if start > end {
+                    return Err(format!("Invalid range '{}-{}'.", start, end));
+                }
+                for i in start..=end {
+                    indices.push(i);
+                }
+                continue;
+            }
+        }
+
+        let idx = token.parse::<usize>().map_err(|_| {
+            format!(
+                "Invalid number '{}'. Use numbers from `view` (e.g. `forget 1, 2`) or `forget all`.",
+                token
+            )
+        })?;
+        if idx == 0 {
+            return Err("Numbers start at 1. Use `view` to see them.".to_string());
+        }
+        indices.push(idx);
+    }
+
+    indices.sort_unstable();
+    indices.dedup();
+
+    for &idx in &indices {
+        if idx > max_facts {
+            if max_facts == 0 {
+                return Err("No memories are currently stored.".to_string());
+            } else if max_facts == 1 {
+                return Err("Only 1 memory item is stored.".to_string());
+            } else {
+                return Err(format!(
+                    "Number {} is out of range. There are only {} memory item(s).",
+                    idx, max_facts
+                ));
+            }
+        }
+    }
+
+    Ok(indices)
+}
