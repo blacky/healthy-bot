@@ -104,3 +104,32 @@ pub fn build_extraction_messages(
         },
     ]
 }
+
+/// Given message IDs (ordered newest-first) and an optional cursor of the last
+/// scanned message ID, determine whether chat has moved and return the new
+/// message IDs along with the updated cursor ID.
+///
+/// If `message_ids` is empty, returns `(vec![], last_scanned_id)`.
+/// If the newest message ID is `<= last_scanned_id`, chat hasn't moved: returns `(vec![], last_scanned_id)`.
+pub fn filter_unscanned_message_ids(
+    message_ids: &[u64],
+    last_scanned_id: Option<u64>,
+) -> (Vec<u64>, Option<u64>) {
+    let Some(&newest_id) = message_ids.first() else {
+        return (Vec::new(), last_scanned_id);
+    };
+
+    if let Some(last_id) = last_scanned_id {
+        if newest_id <= last_id {
+            return (Vec::new(), Some(last_id));
+        }
+        let new_ids: Vec<u64> = message_ids
+            .iter()
+            .copied()
+            .filter(|&id| id > last_id)
+            .collect();
+        (new_ids, Some(newest_id))
+    } else {
+        (message_ids.to_vec(), Some(newest_id))
+    }
+}

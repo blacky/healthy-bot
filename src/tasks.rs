@@ -81,9 +81,39 @@ async fn extract_memory(
     };
     let channel_id: u64 = channel_id_str.parse()?;
 
-    let messages = ChannelId::new(channel_id)
+    let stored_channel_id = db::get_setting(pool, "_memory_last_scanned_channel_id").await;
+    let stored_message_id = db::get_setting(pool, "_memory_last_scanned_message_id").await;
+    let last_scanned_id = if stored_channel_id.as_deref() == Some(&channel_id_str) {
+        stored_message_id.and_then(|s| s.parse::<u64>().ok())
+    } else {
+        None
+    };
+
+    let mut messages = ChannelId::new(channel_id)
         .messages(http, GetMessages::new().limit(100))
         .await?;
+
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    // Discord returns messages newest-first, but sort explicitly to ensure descending order by ID.
+    messages.sort_by_key(|m| std::cmp::Reverse(m.id));
+
+    let newest_id = messages[0].id.get();
+
+    if let Some(last_id) = last_scanned_id {
+        if newest_id <= last_id {
+            log::debug!(
+                "Memory extraction: chat has not moved in channel {} (latest msg {} <= last scanned {}), skipping",
+                channel_id,
+                newest_id,
+                last_id
+            );
+            return Ok(());
+        }
+        messages.retain(|m| m.id.get() > last_id);
+    }
 
     // Collect eligible messages (newest-first; build_transcript reverses them) and
     // the unique participant roster, skipping bots and opted-out users.
@@ -110,9 +140,23 @@ async fn extract_memory(
     }
 
     if participants.is_empty() {
+        let _ = db::set_setting(pool, "_memory_last_scanned_channel_id", &channel_id_str).await;
+        let _ = db::set_setting(
+            pool,
+            "_memory_last_scanned_message_id",
+            &newest_id.to_string(),
+        )
+        .await;
         return Ok(());
     }
     let Some(transcript) = recent::build_transcript(&entries) else {
+        let _ = db::set_setting(pool, "_memory_last_scanned_channel_id", &channel_id_str).await;
+        let _ = db::set_setting(
+            pool,
+            "_memory_last_scanned_message_id",
+            &newest_id.to_string(),
+        )
+        .await;
         return Ok(());
     };
 
@@ -150,40 +194,54 @@ async fn extract_memory(
     }
 
     let Some(choice) = response.choices.first() else {
+        let _ = db::set_setting(pool, "_memory_last_scanned_channel_id", &channel_id_str).await;
+        let _ = db::set_setting(
+            pool,
+            "_memory_last_scanned_message_id",
+            &newest_id.to_string(),
+        )
+        .await;
         return Ok(());
     };
 
     let facts = memory::parse_extracted_facts(choice.message.content_text());
-    if facts.is_empty() {
-        return Ok(());
-    }
+    if !facts.is_empty() {
+        // Only accept facts keyed to a real participant from this batch.
+        let valid_ids: HashSet<&str> = participants.iter().map(|(id, _)| id.as_str()).collect();
+        let now_ms = Utc::now().timestamp_millis();
+        let mut touched: HashSet<String> = HashSet::new();
 
-    // Only accept facts keyed to a real participant from this batch.
-    let valid_ids: HashSet<&str> = participants.iter().map(|(id, _)| id.as_str()).collect();
-    let now_ms = Utc::now().timestamp_millis();
-    let mut touched: HashSet<String> = HashSet::new();
-
-    for f in facts {
-        if !valid_ids.contains(f.user_id.as_str()) {
-            continue;
+        for f in facts {
+            if !valid_ids.contains(f.user_id.as_str()) {
+                continue;
+            }
+            if matches!(
+                db::add_fact(pool, &f.user_id, &f.fact, now_ms).await,
+                Ok(true)
+            ) {
+                touched.insert(f.user_id);
+            }
         }
-        if db::add_fact(pool, &f.user_id, &f.fact, now_ms)
-            .await
-            .is_ok()
-        {
-            touched.insert(f.user_id);
+
+        for id in &touched {
+            let _ = db::prune_facts(pool, id, max_facts).await;
         }
+
+        log::info!(
+            "Memory extraction: {} participants, {} users updated",
+            participants.len(),
+            touched.len()
+        );
     }
 
-    for id in &touched {
-        let _ = db::prune_facts(pool, id, max_facts).await;
-    }
+    let _ = db::set_setting(pool, "_memory_last_scanned_channel_id", &channel_id_str).await;
+    let _ = db::set_setting(
+        pool,
+        "_memory_last_scanned_message_id",
+        &newest_id.to_string(),
+    )
+    .await;
 
-    log::info!(
-        "Memory extraction: {} participants, {} users updated",
-        participants.len(),
-        touched.len()
-    );
     Ok(())
 }
 

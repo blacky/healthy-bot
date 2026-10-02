@@ -56,6 +56,16 @@ pub async fn get_setting(pool: &SqlitePool, key: &str) -> Option<String> {
         .map(|s| s.v)
 }
 
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO setting (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = ?")
+        .bind(key)
+        .bind(value)
+        .bind(value)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_user(pool: &SqlitePool, discord_id: &str) -> Option<User> {
     sqlx::query_as::<_, User>("SELECT * FROM users WHERE discord_id = ?")
         .bind(discord_id)
@@ -108,19 +118,22 @@ pub async fn get_facts(pool: &SqlitePool, discord_id: &str) -> Vec<UserFact> {
 }
 
 /// Insert a fact, ignoring exact duplicates (enforced by the unique index).
+/// Returns true if a new fact was inserted, false if it already existed.
 pub async fn add_fact(
     pool: &SqlitePool,
     discord_id: &str,
     fact: &str,
     created_at: i64,
-) -> sqlx::Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO user_fact (discord_id, fact, created_at) VALUES (?, ?, ?)")
-        .bind(discord_id)
-        .bind(fact)
-        .bind(created_at)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO user_fact (discord_id, fact, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(discord_id)
+    .bind(fact)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Delete a single fact owned by `discord_id`. Returns true if a row was removed

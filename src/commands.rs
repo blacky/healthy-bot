@@ -758,7 +758,7 @@ pub async fn settings(
         }
 
         for (k, v) in db_map {
-            if !processed_keys.contains(&k) {
+            if !k.starts_with('_') && !processed_keys.contains(&k) {
                 settings_list.push((k, v));
             }
         }
@@ -1213,7 +1213,8 @@ async fn reply_facts(ctx: Context<'_>, discord_id: &str, self_view: bool) -> Res
         "memory_forget",
         "memory_clear",
         "memory_optout",
-        "memory_optin"
+        "memory_optin",
+        "memory_insert"
     )
 )]
 pub async fn memory(ctx: Context<'_>) -> Result<(), Error> {
@@ -1323,6 +1324,91 @@ pub async fn memory_optin(ctx: Context<'_>) -> Result<(), Error> {
     db::set_opt_out(pool, &user_id, false).await?;
     ctx.say("You are opted back in to memory.").await?;
     Ok(())
+}
+
+async fn handle_memory_insert(
+    ctx: Context<'_>,
+    user: serenity::User,
+    fact: String,
+) -> Result<(), Error> {
+    if !is_user_admin(ctx).await {
+        return Err(user_error("Unauthorized"));
+    }
+    if user.bot {
+        return Err(user_error("Cannot add memories for bot accounts."));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let user_id = user.id.to_string();
+
+    if db::is_opted_out(pool, &user_id).await {
+        return Err(user_error(format!("{} is opted out of memory.", user.name)));
+    }
+
+    let fact_trimmed = fact.trim();
+    if fact_trimmed.is_empty() {
+        return Err(user_error("Fact cannot be empty."));
+    }
+    if fact_trimmed.len() > 1000 {
+        return Err(user_error("Fact must be under 1000 characters."));
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    db::create_user_if_not_exists(pool, &user_id).await?;
+    let inserted = db::add_fact(pool, &user_id, fact_trimmed, now_ms).await?;
+
+    let max_facts = db::get_setting(pool, "memory_max_facts_per_user")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(20);
+    let _ = db::prune_facts(pool, &user_id, max_facts).await;
+
+    let content = if inserted {
+        format!("Remembered for {}: \"{}\"", user.name, fact_trimmed)
+    } else {
+        format!("That fact is already remembered for {}.", user.name)
+    };
+
+    ctx.send(
+        poise::CreateReply::default()
+            .content(content)
+            .ephemeral(true)
+            .allowed_mentions(serenity::builder::CreateAllowedMentions::new().empty_users()),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Insert a fact for a user without notifying them (admin only)
+#[poise::command(prefix_command, hide_in_help, rename = "insert", aliases("add"))]
+pub async fn memory_insert(
+    ctx: Context<'_>,
+    #[description = "The user to remember a fact about"] user: serenity::User,
+    #[rest]
+    #[description = "The fact to remember about the user"]
+    fact: String,
+) -> Result<(), Error> {
+    handle_memory_insert(ctx, user, fact).await
+}
+
+/// Insert a fact for a user without notifying them (admin only)
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "ADMINISTRATOR",
+    hide_in_help,
+    rename = "memory_insert",
+    aliases("memory_add")
+)]
+pub async fn memory_insert_cmd(
+    ctx: Context<'_>,
+    #[description = "The user to remember a fact about"] user: serenity::User,
+    #[rest]
+    #[description = "The fact to remember about the user"]
+    fact: String,
+) -> Result<(), Error> {
+    handle_memory_insert(ctx, user, fact).await
 }
 
 /// Show help for all commands

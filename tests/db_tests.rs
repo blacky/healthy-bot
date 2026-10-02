@@ -148,10 +148,10 @@ async fn test_facts_add_dedup_and_get() {
     let (pool, _temp) = setup_test_db().await;
     let uid = "111";
 
-    db::add_fact(&pool, uid, "likes hiking", 1).await.unwrap();
-    db::add_fact(&pool, uid, "has a dog", 2).await.unwrap();
-    // Exact duplicate is ignored by the unique index.
-    db::add_fact(&pool, uid, "likes hiking", 3).await.unwrap();
+    assert!(db::add_fact(&pool, uid, "likes hiking", 1).await.unwrap());
+    assert!(db::add_fact(&pool, uid, "has a dog", 2).await.unwrap());
+    // Exact duplicate is ignored by the unique index and returns false.
+    assert!(!db::add_fact(&pool, uid, "likes hiking", 3).await.unwrap());
 
     let facts = db::get_facts(&pool, uid).await;
     assert_eq!(facts.len(), 2);
@@ -267,4 +267,24 @@ async fn test_db_usage_leaderboard() {
     assert_eq!(leaderboard.len(), 2);
     assert_eq!(leaderboard[0].user_id, "userB");
     assert_eq!(leaderboard[1].user_id, "userA");
+}
+
+#[tokio::test]
+async fn test_db_set_and_get_setting() {
+    let (pool, _temp) = setup_test_db().await;
+
+    assert_eq!(db::get_setting(&pool, "test_key").await, None);
+
+    db::set_setting(&pool, "test_key", "value_1").await.unwrap();
+    assert_eq!(
+        db::get_setting(&pool, "test_key").await,
+        Some("value_1".to_string())
+    );
+
+    // Overwrite existing setting
+    db::set_setting(&pool, "test_key", "value_2").await.unwrap();
+    assert_eq!(
+        db::get_setting(&pool, "test_key").await,
+        Some("value_2".to_string())
+    );
 }

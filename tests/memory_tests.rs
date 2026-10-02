@@ -1,5 +1,6 @@
 use healthy_bot::memory::{
-    build_extraction_messages, format_memory_context, parse_extracted_facts,
+    build_extraction_messages, filter_unscanned_message_ids, format_memory_context,
+    parse_extracted_facts,
 };
 
 #[test]
@@ -73,4 +74,45 @@ fn extraction_prompt_embeds_participant_ids_and_transcript() {
     assert!(system.contains("222 (Bob)"));
     assert_eq!(msgs[1].role, "user");
     assert_eq!(msgs[1].content.to_string(), "Alice: hi\nBob: yo");
+}
+
+#[test]
+fn filter_unscanned_empty_input() {
+    let (new_ids, cursor) = filter_unscanned_message_ids(&[], Some(100));
+    assert!(new_ids.is_empty());
+    assert_eq!(cursor, Some(100));
+
+    let (new_ids, cursor) = filter_unscanned_message_ids(&[], None);
+    assert!(new_ids.is_empty());
+    assert_eq!(cursor, None);
+}
+
+#[test]
+fn filter_unscanned_baseline_initial_run() {
+    let ids = vec![300, 200, 100];
+    let (new_ids, cursor) = filter_unscanned_message_ids(&ids, None);
+    assert_eq!(new_ids, vec![300, 200, 100]);
+    assert_eq!(cursor, Some(300));
+}
+
+#[test]
+fn filter_unscanned_chat_has_not_moved() {
+    let ids = vec![300, 200, 100];
+    // Newest message (300) equals last scanned id (300)
+    let (new_ids, cursor) = filter_unscanned_message_ids(&ids, Some(300));
+    assert!(new_ids.is_empty());
+    assert_eq!(cursor, Some(300));
+
+    // Newest message is older than cursor (e.g. recent messages deleted)
+    let (new_ids, cursor) = filter_unscanned_message_ids(&ids, Some(400));
+    assert!(new_ids.is_empty());
+    assert_eq!(cursor, Some(400));
+}
+
+#[test]
+fn filter_unscanned_chat_has_new_messages() {
+    let ids = vec![500, 400, 300, 200, 100];
+    let (new_ids, cursor) = filter_unscanned_message_ids(&ids, Some(300));
+    assert_eq!(new_ids, vec![500, 400]);
+    assert_eq!(cursor, Some(500));
 }
