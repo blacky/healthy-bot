@@ -2274,7 +2274,95 @@ async fn handle_tag_delete(ctx: Context<'_>, server_id: &str, tag_name: &str) ->
     let is_author = tag.author_id == ctx.author().id.to_string();
 
     if !is_admin && !is_author {
-        return Err(user_error("You do not have permission to delete this tag (only the author or a server admin can delete it)."));
+        return Err(user_error(
+            "You do not have permission to delete this tag (only the author or a server admin can delete it).",
+        ));
+    }
+
+    // If deleting someone else's tag, require admin confirmation via buttons
+    if !is_author {
+        let embed = CreateEmbed::new()
+            .title("⚠️ Warning: Force Delete Tag")
+            .description(format!(
+                "Are you sure you want to forcefully delete tag **{}**?\n\n**Owner:** <@{}> ({})\n**Uses:** {}",
+                tag.name, tag.author_id, tag.author_name, tag.uses
+            ))
+            .color(0xFF4444)
+            .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+        let components = vec![serenity::CreateActionRow::Buttons(vec![
+            serenity::CreateButton::new("confirm_force_delete")
+                .label("Force Delete")
+                .style(serenity::ButtonStyle::Danger),
+            serenity::CreateButton::new("cancel_force_delete")
+                .label("Cancel")
+                .style(serenity::ButtonStyle::Secondary),
+        ])];
+
+        let reply = ctx
+            .send(
+                poise::CreateReply::default()
+                    .embed(embed)
+                    .components(components),
+            )
+            .await?;
+
+        let mut collector = reply
+            .message()
+            .await?
+            .await_component_interactions(ctx)
+            .author_id(ctx.author().id)
+            .timeout(std::time::Duration::from_secs(60))
+            .stream();
+
+        if let Some(interaction) = collector.next().await {
+            if interaction.data.custom_id == "confirm_force_delete" {
+                if let Some(filename) = &tag.asset_filename {
+                    if !db::is_asset_used_elsewhere(pool, filename, &tag.id)
+                        .await
+                        .unwrap_or(true)
+                    {
+                        let p = get_tag_assets_dir().join(filename);
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
+                }
+                db::delete_tag(pool, &tag.id).await?;
+                let _ = interaction
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .content(format!("Tag '{}' was forcefully deleted.", tag.name))
+                                .embeds(vec![])
+                                .components(vec![]),
+                        ),
+                    )
+                    .await;
+            } else {
+                let _ = interaction
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .content(format!("Deletion of tag '{}' cancelled.", tag.name))
+                                .embeds(vec![])
+                                .components(vec![]),
+                        ),
+                    )
+                    .await;
+            }
+        } else {
+            let _ = reply
+                .edit(
+                    ctx,
+                    poise::CreateReply::default()
+                        .content(format!("Deletion of tag '{}' timed out.", tag.name))
+                        .components(vec![]),
+                )
+                .await;
+        }
+
+        return Ok(());
     }
 
     if let Some(filename) = &tag.asset_filename {
@@ -2930,7 +3018,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
     let input_str = input.unwrap_or_default();
     let trimmed = input_str.trim();
     if trimmed.is_empty() {
-        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup` | `!t seed`").await?;
+        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` (or `!t raw <name>`) | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup` | `!t seed`").await?;
         return Ok(());
     }
 
@@ -2966,7 +3054,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
                 handle_tag_delete(ctx, &server_id, tag_name).await
             }
         }
-        "info" => {
+        "info" | "raw" => {
             let Some(tag_name) = rest_vec.first() else {
                 return Err(user_error("Please specify a tag name."));
             };
@@ -3003,6 +3091,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
         "tag_alias_slash",
         "tag_delete_slash",
         "tag_info_slash",
+        "tag_raw_slash",
         "tag_list_slash",
         "tag_search_slash",
         "tag_export_slash",
@@ -3342,6 +3431,21 @@ pub async fn tag_delete_slash(
 /// Show statistics and info for a tag
 #[poise::command(slash_command, rename = "info")]
 pub async fn tag_info_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name to inspect"]
+    name: String,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    handle_tag_info(ctx, &server_id, &name).await
+}
+
+/// View a tag's raw content and metadata
+#[poise::command(slash_command, rename = "raw")]
+pub async fn tag_raw_slash(
     ctx: Context<'_>,
     #[autocomplete = "autocomplete_tag_name"]
     #[description = "Tag name to inspect"]
