@@ -2346,15 +2346,12 @@ async fn handle_tag_info(ctx: Context<'_>, server_id: &str, tag_name: &str) -> R
 async fn fetch_tag_list_page(
     pool: &sqlx::sqlite::SqlitePool,
     server_id: &str,
-    target_user: &Option<(String, String)>,
+    author_id: &str,
     page: u32,
     page_size: u32,
 ) -> sqlx::Result<Vec<db::Tag>> {
     let offset = (page - 1) * page_size;
-    match target_user {
-        Some((uid, _)) => db::list_tags_by_author(pool, server_id, uid, offset, page_size).await,
-        None => db::list_tags(pool, server_id, offset, page_size).await,
-    }
+    db::list_tags_by_author(pool, server_id, author_id, offset, page_size).await
 }
 
 async fn handle_tag_list(
@@ -2367,43 +2364,46 @@ async fn handle_tag_list(
     let page_size: u32 = 15;
     page = if page == 0 { 1 } else { page };
 
-    let total = match &target_user {
-        Some((uid, _)) => db::count_tags_by_author(pool, server_id, uid)
-            .await
-            .unwrap_or(0),
-        None => db::count_tags(pool, server_id).await.unwrap_or(0),
+    let (target_id, target_name) = match target_user {
+        Some((uid, uname)) => (uid, uname),
+        None => (ctx.author().id.to_string(), ctx.author().name.clone()),
     };
 
-    let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
+    let total = db::count_tags_by_author(pool, server_id, &target_id)
+        .await
+        .unwrap_or(0);
 
     if total == 0 {
-        let msg = match &target_user {
-            Some((_, uname)) => format!("No tags found for {}.", uname),
-            None => "No tags found on this server.".to_string(),
+        let msg = if target_id == ctx.author().id.to_string() {
+            "You haven't created any tags on this server yet.".to_string()
+        } else {
+            format!("No tags found for {}.", target_name)
         };
         ctx.say(msg).await?;
         return Ok(());
     }
+
+    let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
 
     if page > total_pages {
         page = total_pages;
     }
 
     let build_page_data = |p: u32, total_pages: u32, total: i64, tags: &[db::Tag]| {
-        let title = match &target_user {
-            Some((_, uname)) => format!("Tags by {} (Page {}/{})", uname, p, total_pages),
-            None => format!("Tags List (Page {}/{})", p, total_pages),
+        let title = if total_pages > 1 {
+            format!("Tags by {} (Page {}/{})", target_name, p, total_pages)
+        } else {
+            format!("Tags by {}", target_name)
         };
 
         let mut desc = format!("**Total Tags:** {}\n\n", total);
         let offset = (p - 1) * page_size;
         for (i, t) in tags.iter().enumerate() {
             desc.push_str(&format!(
-                "{}. **{}** — {} uses (by {})\n",
+                "{}. **{}** — {} uses\n",
                 offset + i as u32 + 1,
                 t.name,
-                t.uses,
-                t.author_name
+                t.uses
             ));
         }
 
@@ -2434,7 +2434,7 @@ async fn handle_tag_list(
         (embed, components)
     };
 
-    let initial_tags = fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+    let initial_tags = fetch_tag_list_page(pool, server_id, &target_id, page, page_size).await?;
     let (embed, components) = build_page_data(page, total_pages, total, &initial_tags);
 
     let reply = ctx
@@ -2459,7 +2459,7 @@ async fn handle_tag_list(
             if interaction.data.custom_id == "cancel" {
                 cancelled = true;
                 let tags =
-                    fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+                    fetch_tag_list_page(pool, server_id, &target_id, page, page_size).await?;
                 let (current_embed, _) = build_page_data(page, total_pages, total, &tags);
                 let _ = interaction
                     .create_response(
@@ -2480,7 +2480,7 @@ async fn handle_tag_list(
                 _ => continue,
             }
 
-            let tags = fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+            let tags = fetch_tag_list_page(pool, server_id, &target_id, page, page_size).await?;
             let (new_embed, new_components) = build_page_data(page, total_pages, total, &tags);
             let _ = interaction
                 .create_response(
@@ -2496,7 +2496,7 @@ async fn handle_tag_list(
 
         if !cancelled {
             if let Ok(tags) =
-                fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await
+                fetch_tag_list_page(pool, server_id, &target_id, page, page_size).await
             {
                 let (final_embed, _) = build_page_data(page, total_pages, total, &tags);
                 let _ = reply

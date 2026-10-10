@@ -23,7 +23,7 @@ jobs:
     name: Build, Test & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust Toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -73,7 +73,7 @@ jobs:
 
       - name: Checkout
         if: steps.guard.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Log in to GHCR
         if: steps.guard.outputs.enabled == 'true'

@@ -486,12 +486,11 @@ pub async fn search_tags(
         Some(aid) => {
             sqlx::query_as::<_, Tag>(
                 "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? AND author_id = ? AND (name_normalized LIKE ? OR LOWER(content) LIKE ?) \
-                 ORDER BY uses DESC LIMIT ?",
+                 FROM tags WHERE server_id = ? AND author_id = ? AND name_normalized LIKE ? \
+                 ORDER BY uses DESC, name_normalized ASC LIMIT ?",
             )
             .bind(server_id)
             .bind(aid)
-            .bind(&pattern)
             .bind(&pattern)
             .bind(limit as i64)
             .fetch_all(pool)
@@ -500,11 +499,10 @@ pub async fn search_tags(
         None => {
             sqlx::query_as::<_, Tag>(
                 "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? AND (name_normalized LIKE ? OR LOWER(content) LIKE ?) \
-                 ORDER BY uses DESC LIMIT ?",
+                 FROM tags WHERE server_id = ? AND name_normalized LIKE ? \
+                 ORDER BY uses DESC, name_normalized ASC LIMIT ?",
             )
             .bind(server_id)
-            .bind(&pattern)
             .bind(&pattern)
             .bind(limit as i64)
             .fetch_all(pool)
