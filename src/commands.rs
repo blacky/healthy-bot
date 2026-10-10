@@ -2343,73 +2343,174 @@ async fn handle_tag_info(ctx: Context<'_>, server_id: &str, tag_name: &str) -> R
     Ok(())
 }
 
+async fn fetch_tag_list_page(
+    pool: &sqlx::sqlite::SqlitePool,
+    server_id: &str,
+    target_user: &Option<(String, String)>,
+    page: u32,
+    page_size: u32,
+) -> sqlx::Result<Vec<db::Tag>> {
+    let offset = (page - 1) * page_size;
+    match target_user {
+        Some((uid, _)) => db::list_tags_by_author(pool, server_id, uid, offset, page_size).await,
+        None => db::list_tags(pool, server_id, offset, page_size).await,
+    }
+}
+
 async fn handle_tag_list(
     ctx: Context<'_>,
     server_id: &str,
     target_user: Option<(String, String)>,
-    page: u32,
+    mut page: u32,
 ) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
-    let page = if page == 0 { 1 } else { page };
-    let page_size = 15;
-    let offset = (page - 1) * page_size;
+    let page_size: u32 = 15;
+    page = if page == 0 { 1 } else { page };
 
-    let (total, tags, title) = match &target_user {
-        Some((uid, uname)) => {
-            let total = db::count_tags_by_author(pool, server_id, uid)
-                .await
-                .unwrap_or(0);
-            let tags = db::list_tags_by_author(pool, server_id, uid, offset, page_size).await?;
-            let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
-            (
-                total,
-                tags,
-                format!("Tags by {} (Page {}/{})", uname, page, total_pages),
-            )
-        }
-        None => {
-            let total = db::count_tags(pool, server_id).await.unwrap_or(0);
-            let tags = db::list_tags(pool, server_id, offset, page_size).await?;
-            let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
-            (
-                total,
-                tags,
-                format!("Tags List (Page {}/{})", page, total_pages),
-            )
-        }
+    let total = match &target_user {
+        Some((uid, _)) => db::count_tags_by_author(pool, server_id, uid)
+            .await
+            .unwrap_or(0),
+        None => db::count_tags(pool, server_id).await.unwrap_or(0),
     };
 
     let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
-    if tags.is_empty() {
+
+    if total == 0 {
         let msg = match &target_user {
-            Some((_, uname)) => format!(
-                "No tags found for {} on page {} of {}.",
-                uname, page, total_pages
-            ),
-            None => format!("No tags found on page {} of {}.", page, total_pages),
+            Some((_, uname)) => format!("No tags found for {}.", uname),
+            None => "No tags found on this server.".to_string(),
         };
         ctx.say(msg).await?;
         return Ok(());
     }
 
-    let mut desc = format!("**Total Tags:** {}\n\n", total);
-    for (i, t) in tags.iter().enumerate() {
-        desc.push_str(&format!(
-            "{}. **{}** — {} uses (by {})\n",
-            offset + i as u32 + 1,
-            t.name,
-            t.uses,
-            t.author_name
-        ));
+    if page > total_pages {
+        page = total_pages;
     }
 
-    let embed = CreateEmbed::new()
-        .title(title)
-        .description(desc)
-        .color(0x00FF88)
-        .footer(CreateEmbedFooter::new("Healthy Bot"));
+    let build_page_data = |p: u32, total_pages: u32, total: i64, tags: &[db::Tag]| {
+        let title = match &target_user {
+            Some((_, uname)) => format!("Tags by {} (Page {}/{})", uname, p, total_pages),
+            None => format!("Tags List (Page {}/{})", p, total_pages),
+        };
 
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        let mut desc = format!("**Total Tags:** {}\n\n", total);
+        let offset = (p - 1) * page_size;
+        for (i, t) in tags.iter().enumerate() {
+            desc.push_str(&format!(
+                "{}. **{}** — {} uses (by {})\n",
+                offset + i as u32 + 1,
+                t.name,
+                t.uses,
+                t.author_name
+            ));
+        }
+
+        let embed = CreateEmbed::new()
+            .title(title)
+            .description(desc)
+            .color(0x00FF88)
+            .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+        let components = if total_pages > 1 {
+            vec![serenity::CreateActionRow::Buttons(vec![
+                serenity::CreateButton::new("prev_page")
+                    .label("◀")
+                    .style(serenity::ButtonStyle::Secondary)
+                    .disabled(p <= 1),
+                serenity::CreateButton::new("next_page")
+                    .label("▶")
+                    .style(serenity::ButtonStyle::Secondary)
+                    .disabled(p >= total_pages),
+                serenity::CreateButton::new("cancel")
+                    .label("❌")
+                    .style(serenity::ButtonStyle::Danger),
+            ])]
+        } else {
+            vec![]
+        };
+
+        (embed, components)
+    };
+
+    let initial_tags = fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+    let (embed, components) = build_page_data(page, total_pages, total, &initial_tags);
+
+    let reply = ctx
+        .send(
+            poise::CreateReply::default()
+                .embed(embed)
+                .components(components),
+        )
+        .await?;
+
+    if total_pages > 1 {
+        let mut collector = reply
+            .message()
+            .await?
+            .await_component_interactions(ctx)
+            .author_id(ctx.author().id)
+            .timeout(std::time::Duration::from_secs(60))
+            .stream();
+
+        let mut cancelled = false;
+        while let Some(interaction) = collector.next().await {
+            if interaction.data.custom_id == "cancel" {
+                cancelled = true;
+                let tags =
+                    fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+                let (current_embed, _) = build_page_data(page, total_pages, total, &tags);
+                let _ = interaction
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .embed(current_embed)
+                                .components(vec![]),
+                        ),
+                    )
+                    .await;
+                break;
+            }
+
+            match interaction.data.custom_id.as_str() {
+                "prev_page" => page = page.saturating_sub(1).max(1),
+                "next_page" => page = std::cmp::min(page + 1, total_pages),
+                _ => continue,
+            }
+
+            let tags = fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await?;
+            let (new_embed, new_components) = build_page_data(page, total_pages, total, &tags);
+            let _ = interaction
+                .create_response(
+                    ctx,
+                    serenity::CreateInteractionResponse::UpdateMessage(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .embed(new_embed)
+                            .components(new_components),
+                    ),
+                )
+                .await;
+        }
+
+        if !cancelled {
+            if let Ok(tags) =
+                fetch_tag_list_page(pool, server_id, &target_user, page, page_size).await
+            {
+                let (final_embed, _) = build_page_data(page, total_pages, total, &tags);
+                let _ = reply
+                    .edit(
+                        ctx,
+                        poise::CreateReply::default()
+                            .embed(final_embed)
+                            .components(vec![]),
+                    )
+                    .await;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2442,7 +2543,8 @@ async fn handle_tag_search(
 ) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
     let author_id = target_user.as_ref().map(|(id, _)| id.as_str());
-    let results = db::search_tags(pool, server_id, query, author_id, 25).await?;
+    let page_size = 15;
+    let results = db::search_tags(pool, server_id, query, author_id, 150).await?;
 
     if results.is_empty() {
         let msg = match &target_user {
@@ -2453,33 +2555,138 @@ async fn handle_tag_search(
         return Ok(());
     }
 
-    let title = match &target_user {
-        Some((_, uname)) => format!("Tag Search: '{}' (by {})", query, uname),
-        None => format!("Tag Search: '{}'", query),
+    let total_results = results.len();
+    let total_pages = total_results.div_ceil(page_size) as u32;
+    let mut page: u32 = 1;
+
+    let build_page_data = |p: u32, total_pages: u32, results: &[db::Tag]| {
+        let title = match &target_user {
+            Some((_, uname)) if total_pages > 1 => {
+                format!(
+                    "Tag Search: '{}' (by {}) (Page {}/{})",
+                    query, uname, p, total_pages
+                )
+            }
+            Some((_, uname)) => format!("Tag Search: '{}' (by {})", query, uname),
+            None if total_pages > 1 => {
+                format!("Tag Search: '{}' (Page {}/{})", query, p, total_pages)
+            }
+            None => format!("Tag Search: '{}'", query),
+        };
+
+        let start_idx = (p as usize - 1) * page_size;
+        let end_idx = std::cmp::min(start_idx + page_size, results.len());
+
+        let mut desc = format!(
+            "Found {} matching tag{}:\n\n",
+            results.len(),
+            if results.len() == 1 { "" } else { "s" }
+        );
+        for (i, t) in results[start_idx..end_idx].iter().enumerate() {
+            desc.push_str(&format!(
+                "{}. **{}** — {} uses (by {})\n",
+                start_idx + i + 1,
+                t.name,
+                t.uses,
+                t.author_name
+            ));
+        }
+
+        let embed = CreateEmbed::new()
+            .title(title)
+            .description(desc)
+            .color(0x00FF88)
+            .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+        let components = if total_pages > 1 {
+            vec![serenity::CreateActionRow::Buttons(vec![
+                serenity::CreateButton::new("prev_page")
+                    .label("◀")
+                    .style(serenity::ButtonStyle::Secondary)
+                    .disabled(p <= 1),
+                serenity::CreateButton::new("next_page")
+                    .label("▶")
+                    .style(serenity::ButtonStyle::Secondary)
+                    .disabled(p >= total_pages),
+                serenity::CreateButton::new("cancel")
+                    .label("❌")
+                    .style(serenity::ButtonStyle::Danger),
+            ])]
+        } else {
+            vec![]
+        };
+
+        (embed, components)
     };
 
-    let mut desc = format!(
-        "Found {} matching tag{}:\n\n",
-        results.len(),
-        if results.len() == 1 { "" } else { "s" }
-    );
-    for (i, t) in results.iter().enumerate() {
-        desc.push_str(&format!(
-            "{}. **{}** — {} uses (by {})\n",
-            i + 1,
-            t.name,
-            t.uses,
-            t.author_name
-        ));
+    let (embed, components) = build_page_data(page, total_pages, &results);
+    let reply = ctx
+        .send(
+            poise::CreateReply::default()
+                .embed(embed)
+                .components(components),
+        )
+        .await?;
+
+    if total_pages > 1 {
+        let mut collector = reply
+            .message()
+            .await?
+            .await_component_interactions(ctx)
+            .author_id(ctx.author().id)
+            .timeout(std::time::Duration::from_secs(60))
+            .stream();
+
+        let mut cancelled = false;
+        while let Some(interaction) = collector.next().await {
+            if interaction.data.custom_id == "cancel" {
+                cancelled = true;
+                let (current_embed, _) = build_page_data(page, total_pages, &results);
+                let _ = interaction
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .embed(current_embed)
+                                .components(vec![]),
+                        ),
+                    )
+                    .await;
+                break;
+            }
+
+            match interaction.data.custom_id.as_str() {
+                "prev_page" => page = page.saturating_sub(1).max(1),
+                "next_page" => page = std::cmp::min(page + 1, total_pages),
+                _ => continue,
+            }
+
+            let (new_embed, new_components) = build_page_data(page, total_pages, &results);
+            let _ = interaction
+                .create_response(
+                    ctx,
+                    serenity::CreateInteractionResponse::UpdateMessage(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .embed(new_embed)
+                            .components(new_components),
+                    ),
+                )
+                .await;
+        }
+
+        if !cancelled {
+            let (final_embed, _) = build_page_data(page, total_pages, &results);
+            let _ = reply
+                .edit(
+                    ctx,
+                    poise::CreateReply::default()
+                        .embed(final_embed)
+                        .components(vec![]),
+                )
+                .await;
+        }
     }
 
-    let embed = CreateEmbed::new()
-        .title(title)
-        .description(desc)
-        .color(0x00FF88)
-        .footer(CreateEmbedFooter::new("Healthy Bot"));
-
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
