@@ -521,6 +521,8 @@ async fn main() {
                 commands::register(),
                 commands::usage_leaderboard(),
                 commands::restrict(),
+                commands::t_cmd(),
+                commands::tag_slash(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))

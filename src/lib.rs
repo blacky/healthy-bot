@@ -5,6 +5,7 @@ pub mod markov;
 pub mod memory;
 pub mod openai;
 pub mod recent;
+pub mod tags;
 pub mod tasks;
 
 use crate::markov::MarkovRepository;

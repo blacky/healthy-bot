@@ -288,3 +288,323 @@ pub async fn get_usage_leaderboard(pool: &SqlitePool, limit: u32) -> sqlx::Resul
     .fetch_all(pool)
     .await
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Tag {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub name_normalized: String,
+    pub content: String,
+    pub asset_filename: Option<String>,
+    pub author_id: String,
+    pub author_name: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub uses: i64,
+}
+
+pub async fn get_tag(pool: &SqlitePool, server_id: &str, name: &str) -> Option<Tag> {
+    let name_norm = name.trim().to_lowercase();
+    sqlx::query_as::<_, Tag>(
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? AND name_normalized = ?",
+    )
+    .bind(server_id)
+    .bind(name_norm)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+pub async fn search_tag_names(
+    pool: &SqlitePool,
+    server_id: &str,
+    query: &str,
+    limit: u32,
+) -> Vec<String> {
+    let query_norm = format!("{}%", query.trim().to_lowercase());
+    sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM tags WHERE server_id = ? AND name_normalized LIKE ? ORDER BY uses DESC LIMIT ?",
+    )
+    .bind(server_id)
+    .bind(query_norm)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(n,)| n)
+    .collect()
+}
+
+pub async fn create_tag(pool: &SqlitePool, tag: &Tag) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO tags (id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&tag.id)
+    .bind(&tag.server_id)
+    .bind(&tag.name)
+    .bind(&tag.name_normalized)
+    .bind(&tag.content)
+    .bind(&tag.asset_filename)
+    .bind(&tag.author_id)
+    .bind(&tag.author_name)
+    .bind(tag.created_at)
+    .bind(tag.last_used_at)
+    .bind(tag.uses)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_tag(
+    pool: &SqlitePool,
+    tag_id: &str,
+    new_content: &str,
+    new_asset: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE tags SET content = ?, asset_filename = ? WHERE id = ?")
+        .bind(new_content)
+        .bind(new_asset)
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_tag(pool: &SqlitePool, tag_id: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("DELETE FROM tags WHERE id = ?")
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn increment_tag_uses(pool: &SqlitePool, tag_id: &str, used_at: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE tags SET uses = uses + 1, last_used_at = ? WHERE id = ?")
+        .bind(used_at)
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_tags(
+    pool: &SqlitePool,
+    server_id: &str,
+    offset: u32,
+    limit: u32,
+) -> sqlx::Result<Vec<Tag>> {
+    sqlx::query_as::<_, Tag>(
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? ORDER BY uses DESC, name_normalized ASC LIMIT ? OFFSET ?",
+    )
+    .bind(server_id)
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_tags(pool: &SqlitePool, server_id: &str) -> sqlx::Result<i64> {
+    let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM tags WHERE server_id = ?")
+        .bind(server_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+pub async fn get_random_tag(pool: &SqlitePool, server_id: &str) -> Option<Tag> {
+    sqlx::query_as::<_, Tag>(
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? ORDER BY RANDOM() LIMIT 1",
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+pub async fn rename_tag(pool: &SqlitePool, tag_id: &str, new_name: &str) -> sqlx::Result<()> {
+    let new_name_norm = new_name.trim().to_lowercase();
+    sqlx::query("UPDATE tags SET name = ?, name_normalized = ? WHERE id = ?")
+        .bind(new_name)
+        .bind(new_name_norm)
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_tags_by_author(
+    pool: &SqlitePool,
+    server_id: &str,
+    author_id: &str,
+    offset: u32,
+    limit: u32,
+) -> sqlx::Result<Vec<Tag>> {
+    sqlx::query_as::<_, Tag>(
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? AND author_id = ? ORDER BY uses DESC, name_normalized ASC LIMIT ? OFFSET ?",
+    )
+    .bind(server_id)
+    .bind(author_id)
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn count_tags_by_author(
+    pool: &SqlitePool,
+    server_id: &str,
+    author_id: &str,
+) -> sqlx::Result<i64> {
+    let row = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM tags WHERE server_id = ? AND author_id = ?",
+    )
+    .bind(server_id)
+    .bind(author_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn search_tags(
+    pool: &SqlitePool,
+    server_id: &str,
+    query: &str,
+    author_id: Option<&str>,
+    limit: u32,
+) -> sqlx::Result<Vec<Tag>> {
+    let pattern = format!("%{}%", query.trim().to_lowercase());
+    match author_id {
+        Some(aid) => {
+            sqlx::query_as::<_, Tag>(
+                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+                 FROM tags WHERE server_id = ? AND author_id = ? AND (name_normalized LIKE ? OR LOWER(content) LIKE ?) \
+                 ORDER BY uses DESC LIMIT ?",
+            )
+            .bind(server_id)
+            .bind(aid)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, Tag>(
+                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+                 FROM tags WHERE server_id = ? AND (name_normalized LIKE ? OR LOWER(content) LIKE ?) \
+                 ORDER BY uses DESC LIMIT ?",
+            )
+            .bind(server_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn is_asset_used_elsewhere(
+    pool: &SqlitePool,
+    asset_filename: &str,
+    excluded_tag_id: &str,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM tags WHERE asset_filename = ? AND id != ?",
+    )
+    .bind(asset_filename)
+    .bind(excluded_tag_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 > 0)
+}
+
+pub async fn export_all_tags(
+    pool: &SqlitePool,
+    server_id: &str,
+    author_id: Option<&str>,
+) -> sqlx::Result<Vec<Tag>> {
+    match author_id {
+        Some(aid) => {
+            sqlx::query_as::<_, Tag>(
+                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+                 FROM tags WHERE server_id = ? AND author_id = ? ORDER BY name_normalized ASC",
+            )
+            .bind(server_id)
+            .bind(aid)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, Tag>(
+                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+                 FROM tags WHERE server_id = ? ORDER BY name_normalized ASC",
+            )
+            .bind(server_id)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn delete_all_tags(
+    pool: &SqlitePool,
+    server_id: &str,
+    author_id: Option<&str>,
+) -> sqlx::Result<(u64, Vec<Option<String>>)> {
+    let asset_files: Vec<(Option<String>,)> = match author_id {
+        Some(aid) => {
+            sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT asset_filename FROM tags WHERE server_id = ? AND author_id = ? AND asset_filename IS NOT NULL",
+            )
+            .bind(server_id)
+            .bind(aid)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT asset_filename FROM tags WHERE server_id = ? AND asset_filename IS NOT NULL",
+            )
+            .bind(server_id)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    let count = match author_id {
+        Some(aid) => sqlx::query("DELETE FROM tags WHERE server_id = ? AND author_id = ?")
+            .bind(server_id)
+            .bind(aid)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        None => sqlx::query("DELETE FROM tags WHERE server_id = ?")
+            .bind(server_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    };
+
+    Ok((count, asset_files.into_iter().map(|(f,)| f).collect()))
+}
+
+pub async fn get_all_asset_filenames(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT DISTINCT asset_filename FROM tags WHERE asset_filename IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(f,)| f).collect())
+}

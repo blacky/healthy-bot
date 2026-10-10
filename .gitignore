@@ -9,6 +9,9 @@ target/
 # Markov data
 markovs/
 
+# Tag assets & local data
+data/
+
 # Environment and Secrets
 .env
 

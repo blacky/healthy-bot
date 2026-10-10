@@ -3,6 +3,7 @@ use crate::memory;
 use crate::openai::{ChatMessage, ChatMessageRequestContent};
 use crate::recent;
 use crate::split_message;
+use crate::tags;
 use crate::truncate_str;
 use crate::user_error;
 use crate::Data;
@@ -1847,4 +1848,1346 @@ pub async fn restrict(
     .await?;
 
     Ok(())
+}
+
+async fn autocomplete_tag_name(ctx: Context<'_>, partial: &str) -> Vec<String> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    db::search_tag_names(&ctx.data().db_pool, &server_id, partial, 25).await
+}
+
+async fn download_discord_cdn_url(url: &str, tag_id: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        )
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let bytes = resp.bytes().await.ok()?;
+
+    let path_part = url.split('?').next().unwrap_or(url);
+    let ext = path_part
+        .split('.')
+        .next_back()
+        .unwrap_or("png")
+        .split('/')
+        .next()
+        .unwrap_or("png");
+    let ext = if ext.len() > 5 || ext.is_empty() {
+        "png"
+    } else {
+        ext
+    };
+
+    let filename = format!("{}.{}", tag_id, ext);
+    let target_path = std::path::Path::new("data")
+        .join("tag_assets")
+        .join(&filename);
+
+    tokio::fs::create_dir_all("data/tag_assets").await.ok()?;
+    tokio::fs::write(&target_path, &bytes).await.ok()?;
+
+    Some(filename)
+}
+
+async fn extract_and_download_discord_cdn_asset(
+    content: &str,
+    tag_id: &str,
+) -> (String, Option<String>) {
+    // 1. Check for {attach:https://cdn.discordapp.com/attachments/...} or media.discordapp.net
+    if let Ok(attach_re) = regex::Regex::new(
+        r"\{attach:(https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)/attachments/[^}]+)\}",
+    ) {
+        if let Some(caps) = attach_re.captures(content) {
+            if let Some(m) = caps.get(1) {
+                if let Some(filename) = download_discord_cdn_url(m.as_str(), tag_id).await {
+                    let cleaned = attach_re.replace(content, "").trim().to_string();
+                    return (cleaned, Some(filename));
+                }
+            }
+        }
+    }
+
+    // 2. Check for bare Discord CDN attachment URL in content
+    if let Ok(url_re) = regex::Regex::new(
+        r"https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)/attachments/[^\s<>]+",
+    ) {
+        if let Some(m) = url_re.find(content) {
+            if let Some(filename) = download_discord_cdn_url(m.as_str(), tag_id).await {
+                let cleaned = url_re.replace(content, "").trim().to_string();
+                return (cleaned, Some(filename));
+            }
+        }
+    }
+
+    (content.to_string(), None)
+}
+
+async fn send_tag(ctx: Context<'_>, tag: &db::Tag, args: &[String]) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let _ = db::increment_tag_uses(pool, &tag.id, Utc::now().timestamp_millis()).await;
+
+    let tag_ctx = tags::TagContext {
+        author_mention: format!("<@{}>", ctx.author().id),
+        author_name: ctx.author().name.clone(),
+        args,
+    };
+    let evaluated = tags::evaluate_tag(&tag.content, &tag_ctx, tag.asset_filename.as_deref());
+
+    let attachment = if let Some(filename) = &evaluated.asset_filename {
+        let asset_path = std::path::Path::new("data")
+            .join("tag_assets")
+            .join(filename);
+        if asset_path.exists() {
+            match serenity::all::CreateAttachment::path(&asset_path).await {
+                Ok(att) => Some(att),
+                Err(e) => {
+                    log::error!("Failed to attach file {:?}: {}", asset_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if evaluated.text.len() <= 2000 {
+        let mut reply = poise::CreateReply::default();
+        if !evaluated.text.is_empty() {
+            reply = reply.content(&evaluated.text);
+        }
+        if let Some(att) = attachment {
+            reply = reply.attachment(att);
+        }
+        ctx.send(reply).await?;
+    } else {
+        let chunks = split_message(&evaluated.text, 2000);
+        let mut first = true;
+        for chunk in chunks {
+            let mut reply = poise::CreateReply::default().content(chunk);
+            if first {
+                if let Some(att) = attachment.clone() {
+                    reply = reply.attachment(att);
+                }
+                first = false;
+            }
+            ctx.send(reply).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_tag_create_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let Some(tag_name) = args.first() else {
+        return Err(user_error(
+            "Usage: `!t add <name> [content]` (or attach a file)",
+        ));
+    };
+
+    if tag_name.len() > 100 {
+        return Err(user_error("Tag name is too long (max 100 characters)."));
+    }
+
+    if tag_name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    if db::get_tag(pool, server_id, tag_name).await.is_some() {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            tag_name
+        )));
+    }
+
+    let raw_content = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        String::new()
+    };
+
+    let tag_id = Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    let mut asset_filename = None;
+
+    if let poise::Context::Prefix(p_ctx) = ctx {
+        if let Some(attachment) = p_ctx.msg.attachments.first() {
+            let ext = attachment.filename.split('.').next_back().unwrap_or("png");
+            let filename = format!("{}.{}", tag_id, ext);
+            let target_path = std::path::Path::new("data")
+                .join("tag_assets")
+                .join(&filename);
+
+            if let Ok(bytes) = attachment.download().await {
+                tokio::fs::create_dir_all("data/tag_assets").await.ok();
+                if tokio::fs::write(&target_path, &bytes).await.is_ok() {
+                    asset_filename = Some(filename);
+                }
+            }
+        }
+    }
+
+    let (content, cdn_asset) = if asset_filename.is_none() {
+        extract_and_download_discord_cdn_asset(&raw_content, &tag_id).await
+    } else {
+        (raw_content, None)
+    };
+    if let Some(a) = cdn_asset {
+        asset_filename = Some(a);
+    }
+
+    if content.is_empty() && asset_filename.is_none() {
+        return Err(user_error("Tag must have content or an attachment."));
+    }
+
+    let new_tag = db::Tag {
+        id: tag_id,
+        server_id: server_id.to_string(),
+        name: tag_name.clone(),
+        name_normalized: tag_name.trim().to_lowercase(),
+        content,
+        asset_filename,
+        author_id: ctx.author().id.to_string(),
+        author_name: ctx.author().name.clone(),
+        created_at: Utc::now().timestamp_millis(),
+        last_used_at: None,
+        uses: 0,
+    };
+
+    db::create_tag(pool, &new_tag).await?;
+    ctx.say(format!("Tag '{}' created!", tag_name)).await?;
+    Ok(())
+}
+
+async fn handle_tag_edit_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let Some(tag_name) = args.first() else {
+        return Err(user_error(
+            "Usage: `!t edit <name> [new_content]` (or attach a file)",
+        ));
+    };
+
+    let Some(tag) = db::get_tag(pool, server_id, tag_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", tag_name)));
+    };
+
+    let is_admin = is_server_admin(ctx).await;
+    let is_author = tag.author_id == ctx.author().id.to_string();
+    if !is_admin && !is_author {
+        return Err(user_error("You do not have permission to edit this tag (only the author or a server admin can edit it)."));
+    }
+
+    let mut new_asset_filename = tag.asset_filename.clone();
+    let mut uploaded_file = false;
+
+    if let poise::Context::Prefix(p_ctx) = ctx {
+        if let Some(attachment) = p_ctx.msg.attachments.first() {
+            let ext = attachment.filename.split('.').next_back().unwrap_or("png");
+            let filename = format!("{}_{}.{}", tag.id, Utc::now().timestamp_millis(), ext);
+            let target_path = std::path::Path::new("data")
+                .join("tag_assets")
+                .join(&filename);
+
+            if let Ok(bytes) = attachment.download().await {
+                tokio::fs::create_dir_all("data/tag_assets").await.ok();
+                if tokio::fs::write(&target_path, &bytes).await.is_ok() {
+                    new_asset_filename = Some(filename);
+                    uploaded_file = true;
+                }
+            }
+        }
+    }
+
+    let raw_content = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        tag.content.clone()
+    };
+
+    let (new_content, cdn_asset) = if !uploaded_file {
+        extract_and_download_discord_cdn_asset(&raw_content, &tag.id).await
+    } else {
+        (raw_content, None)
+    };
+    if let Some(a) = cdn_asset {
+        new_asset_filename = Some(a);
+    }
+
+    if new_content.is_empty() && new_asset_filename.is_none() {
+        return Err(user_error("Tag must have content or an attachment."));
+    }
+
+    db::update_tag(pool, &tag.id, &new_content, new_asset_filename.as_deref()).await?;
+    ctx.say(format!("Tag '{}' updated!", tag.name)).await?;
+    Ok(())
+}
+
+async fn handle_tag_rename(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    if args.len() < 2 {
+        return Err(user_error("Usage: `!t rename <old_name> <new_name>`"));
+    }
+    let old_name = &args[0];
+    let new_name = &args[1];
+
+    if new_name.len() > 100 {
+        return Err(user_error("Tag name is too long (max 100 characters)."));
+    }
+
+    if new_name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    let Some(tag) = db::get_tag(pool, server_id, old_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", old_name)));
+    };
+
+    let is_admin = is_server_admin(ctx).await;
+    let is_author = tag.author_id == ctx.author().id.to_string();
+    if !is_admin && !is_author {
+        return Err(user_error("You do not have permission to rename this tag (only the author or a server admin can rename it)."));
+    }
+
+    if old_name.trim().to_lowercase() != new_name.trim().to_lowercase()
+        && db::get_tag(pool, server_id, new_name).await.is_some()
+    {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            new_name
+        )));
+    }
+
+    db::rename_tag(pool, &tag.id, new_name).await?;
+    ctx.say(format!("Tag '{}' renamed to '{}'.", tag.name, new_name))
+        .await?;
+    Ok(())
+}
+
+async fn handle_tag_alias(ctx: Context<'_>, server_id: &str, args: &[String]) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    if args.len() < 2 {
+        return Err(user_error("Usage: `!t alias <existing_name> <alias_name>`"));
+    }
+    let existing_name = &args[0];
+    let alias_name = &args[1];
+
+    if alias_name.len() > 100 {
+        return Err(user_error(
+            "Alias tag name is too long (max 100 characters).",
+        ));
+    }
+
+    if alias_name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    let Some(existing_tag) = db::get_tag(pool, server_id, existing_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", existing_name)));
+    };
+
+    if db::get_tag(pool, server_id, alias_name).await.is_some() {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            alias_name
+        )));
+    }
+
+    let tag_id = Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    let alias_tag = db::Tag {
+        id: tag_id,
+        server_id: server_id.to_string(),
+        name: alias_name.to_string(),
+        name_normalized: alias_name.trim().to_lowercase(),
+        content: existing_tag.content.clone(),
+        asset_filename: existing_tag.asset_filename.clone(),
+        author_id: ctx.author().id.to_string(),
+        author_name: ctx.author().name.clone(),
+        created_at: Utc::now().timestamp_millis(),
+        last_used_at: None,
+        uses: 0,
+    };
+
+    db::create_tag(pool, &alias_tag).await?;
+    ctx.say(format!(
+        "Created alias '{}' for tag '{}'.",
+        alias_name, existing_tag.name
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn handle_tag_delete(ctx: Context<'_>, server_id: &str, tag_name: &str) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let Some(tag) = db::get_tag(pool, server_id, tag_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", tag_name)));
+    };
+
+    let is_admin = is_server_admin(ctx).await;
+    let is_author = tag.author_id == ctx.author().id.to_string();
+
+    if !is_admin && !is_author {
+        return Err(user_error("You do not have permission to delete this tag (only the author or a server admin can delete it)."));
+    }
+
+    if let Some(filename) = &tag.asset_filename {
+        if !db::is_asset_used_elsewhere(pool, filename, &tag.id)
+            .await
+            .unwrap_or(true)
+        {
+            let p = std::path::Path::new("data")
+                .join("tag_assets")
+                .join(filename);
+            let _ = tokio::fs::remove_file(p).await;
+        }
+    }
+
+    db::delete_tag(pool, &tag.id).await?;
+    ctx.say(format!("Tag '{}' deleted.", tag.name)).await?;
+    Ok(())
+}
+
+async fn handle_tag_info(ctx: Context<'_>, server_id: &str, tag_name: &str) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let Some(tag) = db::get_tag(pool, server_id, tag_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", tag_name)));
+    };
+
+    let created_dt = chrono::DateTime::from_timestamp_millis(tag.created_at)
+        .map(|dt| {
+            dt.with_timezone(&Amsterdam)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let last_used_dt = tag
+        .last_used_at
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|dt| {
+            dt.with_timezone(&Amsterdam)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Never".to_string());
+
+    let embed = CreateEmbed::new()
+        .title(format!("Tag: {}", tag.name))
+        .field(
+            "Author",
+            format!("<@{}> ({})", tag.author_id, tag.author_name),
+            true,
+        )
+        .field("Uses", tag.uses.to_string(), true)
+        .field(
+            "Has Local Media",
+            if tag.asset_filename.is_some() {
+                "Yes"
+            } else {
+                "No"
+            },
+            true,
+        )
+        .field("Created", created_dt, true)
+        .field("Last Used", last_used_dt, true)
+        .field("Content Preview", truncate_str(&tag.content, 200), false)
+        .color(0x00FF88)
+        .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+async fn handle_tag_list(
+    ctx: Context<'_>,
+    server_id: &str,
+    target_user: Option<(String, String)>,
+    page: u32,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let page = if page == 0 { 1 } else { page };
+    let page_size = 15;
+    let offset = (page - 1) * page_size;
+
+    let (total, tags, title) = match &target_user {
+        Some((uid, uname)) => {
+            let total = db::count_tags_by_author(pool, server_id, uid)
+                .await
+                .unwrap_or(0);
+            let tags = db::list_tags_by_author(pool, server_id, uid, offset, page_size).await?;
+            let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
+            (
+                total,
+                tags,
+                format!("Tags by {} (Page {}/{})", uname, page, total_pages),
+            )
+        }
+        None => {
+            let total = db::count_tags(pool, server_id).await.unwrap_or(0);
+            let tags = db::list_tags(pool, server_id, offset, page_size).await?;
+            let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
+            (
+                total,
+                tags,
+                format!("Tags List (Page {}/{})", page, total_pages),
+            )
+        }
+    };
+
+    let total_pages = ((total + page_size as i64 - 1) / page_size as i64).max(1) as u32;
+    if tags.is_empty() {
+        let msg = match &target_user {
+            Some((_, uname)) => format!(
+                "No tags found for {} on page {} of {}.",
+                uname, page, total_pages
+            ),
+            None => format!("No tags found on page {} of {}.", page, total_pages),
+        };
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+
+    let mut desc = format!("**Total Tags:** {}\n\n", total);
+    for (i, t) in tags.iter().enumerate() {
+        desc.push_str(&format!(
+            "{}. **{}** — {} uses (by {})\n",
+            offset + i as u32 + 1,
+            t.name,
+            t.uses,
+            t.author_name
+        ));
+    }
+
+    let embed = CreateEmbed::new()
+        .title(title)
+        .description(desc)
+        .color(0x00FF88)
+        .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+async fn handle_tag_list_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let mut target_user: Option<(String, String)> = None;
+    let mut page: u32 = 1;
+
+    for arg in args {
+        if let Ok(p) = arg.parse::<u32>() {
+            page = p;
+        } else if target_user.is_none() {
+            if let Ok(u) = resolve_user(ctx, arg).await {
+                target_user = Some(u);
+            }
+        }
+    }
+
+    handle_tag_list(ctx, server_id, target_user, page).await
+}
+
+async fn handle_tag_search(
+    ctx: Context<'_>,
+    server_id: &str,
+    query: &str,
+    target_user: Option<(String, String)>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let author_id = target_user.as_ref().map(|(id, _)| id.as_str());
+    let results = db::search_tags(pool, server_id, query, author_id, 25).await?;
+
+    if results.is_empty() {
+        let msg = match &target_user {
+            Some((_, uname)) => format!("No tags matching '{}' found by {}.", query, uname),
+            None => format!("No tags found matching '{}'.", query),
+        };
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+
+    let title = match &target_user {
+        Some((_, uname)) => format!("Tag Search: '{}' (by {})", query, uname),
+        None => format!("Tag Search: '{}'", query),
+    };
+
+    let mut desc = format!(
+        "Found {} matching tag{}:\n\n",
+        results.len(),
+        if results.len() == 1 { "" } else { "s" }
+    );
+    for (i, t) in results.iter().enumerate() {
+        desc.push_str(&format!(
+            "{}. **{}** — {} uses (by {})\n",
+            i + 1,
+            t.name,
+            t.uses,
+            t.author_name
+        ));
+    }
+
+    let embed = CreateEmbed::new()
+        .title(title)
+        .description(desc)
+        .color(0x00FF88)
+        .footer(CreateEmbedFooter::new("Healthy Bot"));
+
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+async fn handle_tag_search_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let mut query_words = Vec::new();
+    let mut target_user: Option<(String, String)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-user" && i + 1 < args.len() {
+            if let Ok(u) = resolve_user(ctx, &args[i + 1]).await {
+                target_user = Some(u);
+            }
+            i += 2;
+        } else {
+            query_words.push(args[i].clone());
+            i += 1;
+        }
+    }
+
+    let query = query_words.join(" ");
+    if query.trim().is_empty() && target_user.is_none() {
+        return Err(user_error("Usage: `!t search <query> [-user <user>]`"));
+    }
+
+    handle_tag_search(ctx, server_id, &query, target_user).await
+}
+
+async fn handle_tag_export(
+    ctx: Context<'_>,
+    server_id: &str,
+    target_user: Option<(String, String)>,
+) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error("Only server administrators can export tags."));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let author_id = target_user.as_ref().map(|(id, _)| id.as_str());
+    let tags = db::export_all_tags(pool, server_id, author_id).await?;
+
+    if tags.is_empty() {
+        ctx.say("No tags found to export.").await?;
+        return Ok(());
+    }
+
+    let json_bytes = serde_json::to_vec_pretty(&tags)?;
+    let filename = match &target_user {
+        Some((uid, _)) => format!("tags-export-{}-{}.json", server_id, uid),
+        None => format!("tags-export-{}.json", server_id),
+    };
+
+    let attachment = serenity::all::CreateAttachment::bytes(json_bytes, filename);
+    let reply = poise::CreateReply::default()
+        .content(format!("Exported {} tags.", tags.len()))
+        .attachment(attachment);
+
+    ctx.send(reply).await?;
+    Ok(())
+}
+
+async fn handle_tag_export_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error("Only server administrators can export tags."));
+    }
+
+    let mut target_user: Option<(String, String)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-user" && i + 1 < args.len() {
+            if let Ok(u) = resolve_user(ctx, &args[i + 1]).await {
+                target_user = Some(u);
+            }
+            i += 2;
+        } else if target_user.is_none() {
+            if let Ok(u) = resolve_user(ctx, &args[i]).await {
+                target_user = Some(u);
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    handle_tag_export(ctx, server_id, target_user).await
+}
+
+async fn handle_tag_remove_all(
+    ctx: Context<'_>,
+    server_id: &str,
+    target_user: Option<(String, String)>,
+) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error(
+            "Only server administrators can remove all tags.",
+        ));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let author_id = target_user.as_ref().map(|(id, _)| id.as_str());
+    let (deleted_count, asset_files) = db::delete_all_tags(pool, server_id, author_id).await?;
+
+    for f in asset_files.into_iter().flatten() {
+        if !db::is_asset_used_elsewhere(pool, &f, "")
+            .await
+            .unwrap_or(true)
+        {
+            let path = std::path::Path::new("data").join("tag_assets").join(&f);
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    if let Some((_, name)) = target_user {
+        ctx.say(format!(
+            "Deleted {} tags authored by {}.",
+            deleted_count, name
+        ))
+        .await?;
+    } else {
+        ctx.say(format!(
+            "Deleted all {} tags on this server.",
+            deleted_count
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_tag_remove_all_prefix(
+    ctx: Context<'_>,
+    server_id: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error(
+            "Only server administrators can remove all tags.",
+        ));
+    }
+
+    let mut target_user: Option<(String, String)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-user" && i + 1 < args.len() {
+            if let Ok(u) = resolve_user(ctx, &args[i + 1]).await {
+                target_user = Some(u);
+            }
+            i += 2;
+        } else if target_user.is_none() {
+            if let Ok(u) = resolve_user(ctx, &args[i]).await {
+                target_user = Some(u);
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    handle_tag_remove_all(ctx, server_id, target_user).await
+}
+
+async fn handle_tag_cleanup(ctx: Context<'_>) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error(
+            "Only server administrators can clean up tag assets.",
+        ));
+    }
+
+    let pool = &ctx.data().db_pool;
+    let active_assets = db::get_all_asset_filenames(pool).await?;
+
+    let assets_dir = std::path::Path::new("data").join("tag_assets");
+    if !assets_dir.exists() {
+        ctx.say("Asset directory does not exist. No files to clean up.")
+            .await?;
+        return Ok(());
+    }
+
+    let mut dir_entries = tokio::fs::read_dir(&assets_dir).await?;
+    let mut removed_count = 0;
+    let mut reclaimed_bytes: u64 = 0;
+
+    while let Ok(Some(entry)) = dir_entries.next_entry().await {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !active_assets.contains(&file_name) {
+            if let Ok(metadata) = entry.metadata().await {
+                reclaimed_bytes += metadata.len();
+            }
+            if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                removed_count += 1;
+            }
+        }
+    }
+
+    let reclaimed_mb = reclaimed_bytes as f64 / 1_048_576.0;
+    ctx.say(format!(
+        "Asset cleanup complete. Removed {} orphaned file(s), reclaiming {:.2} MB.",
+        removed_count, reclaimed_mb
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Tag command: invoke, create, delete, or inspect tags
+#[poise::command(prefix_command, rename = "t", aliases("tag"))]
+pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    let input_str = input.unwrap_or_default();
+    let trimmed = input_str.trim();
+    if trimmed.is_empty() {
+        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup`").await?;
+        return Ok(());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    let rest_vec: Vec<String> = parts.map(|s| s.to_string()).collect();
+
+    match first.to_lowercase().as_str() {
+        "random" | "rand" => {
+            if let Some(tag) = db::get_random_tag(pool, &server_id).await {
+                send_tag(ctx, &tag, &rest_vec).await
+            } else {
+                Err(user_error("No tags found on this server."))
+            }
+        }
+        "add" | "create" => handle_tag_create_prefix(ctx, &server_id, &rest_vec).await,
+        "edit" => handle_tag_edit_prefix(ctx, &server_id, &rest_vec).await,
+        "rename" => handle_tag_rename(ctx, &server_id, &rest_vec).await,
+        "alias" => handle_tag_alias(ctx, &server_id, &rest_vec).await,
+        "cleanup" => handle_tag_cleanup(ctx).await,
+        "delete" | "del" | "remove" | "rm" => {
+            if rest_vec.first().map(|s| s.as_str()) == Some("all") {
+                handle_tag_remove_all_prefix(ctx, &server_id, &rest_vec[1..]).await
+            } else {
+                let clean_args: Vec<String> = rest_vec
+                    .into_iter()
+                    .filter(|s| s != "tag" && s != "-force")
+                    .collect();
+                let Some(tag_name) = clean_args.first() else {
+                    return Err(user_error("Please specify a tag name to delete."));
+                };
+                handle_tag_delete(ctx, &server_id, tag_name).await
+            }
+        }
+        "info" => {
+            let Some(tag_name) = rest_vec.first() else {
+                return Err(user_error("Please specify a tag name."));
+            };
+            handle_tag_info(ctx, &server_id, tag_name).await
+        }
+        "list" => handle_tag_list_prefix(ctx, &server_id, &rest_vec).await,
+        "search" => handle_tag_search_prefix(ctx, &server_id, &rest_vec).await,
+        "export" => handle_tag_export_prefix(ctx, &server_id, &rest_vec).await,
+        _ => {
+            if let Some(tag) = db::get_tag(pool, &server_id, first).await {
+                send_tag(ctx, &tag, &rest_vec).await
+            } else if let Some(tag) = db::get_tag(pool, &server_id, trimmed).await {
+                send_tag(ctx, &tag, &[]).await
+            } else {
+                Err(user_error(format!(
+                    "Tag '{}' not found.",
+                    truncate_str(first, 50)
+                )))
+            }
+        }
+    }
+}
+
+/// Tag management commands
+#[poise::command(
+    slash_command,
+    rename = "tag",
+    subcommands(
+        "tag_get_slash",
+        "tag_random_slash",
+        "tag_create_slash",
+        "tag_edit_slash",
+        "tag_rename_slash",
+        "tag_alias_slash",
+        "tag_delete_slash",
+        "tag_info_slash",
+        "tag_list_slash",
+        "tag_search_slash",
+        "tag_export_slash",
+        "tag_remove_all_slash",
+        "tag_cleanup_slash"
+    )
+)]
+pub async fn tag_slash(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
+/// Retrieve and send a tag
+#[poise::command(slash_command, rename = "get")]
+pub async fn tag_get_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name"]
+    name: String,
+    #[description = "Arguments to pass to the tag"] args: Option<String>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    let Some(tag) = db::get_tag(pool, &server_id, &name).await else {
+        return Err(user_error(format!(
+            "Tag '{}' not found.",
+            truncate_str(&name, 50)
+        )));
+    };
+
+    let args_vec: Vec<String> = args
+        .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
+        .unwrap_or_default();
+
+    send_tag(ctx, &tag, &args_vec).await
+}
+
+/// Retrieve and send a random tag
+#[poise::command(slash_command, rename = "random")]
+pub async fn tag_random_slash(
+    ctx: Context<'_>,
+    #[description = "Arguments to pass to the tag"] args: Option<String>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    if let Some(tag) = db::get_random_tag(pool, &server_id).await {
+        let args_vec: Vec<String> = args
+            .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
+            .unwrap_or_default();
+        send_tag(ctx, &tag, &args_vec).await
+    } else {
+        Err(user_error("No tags found on this server."))
+    }
+}
+
+/// Create a new tag
+#[poise::command(slash_command, rename = "create")]
+pub async fn tag_create_slash(
+    ctx: Context<'_>,
+    #[description = "Tag name"] name: String,
+    #[description = "Tag text content"] content: Option<String>,
+    #[description = "Optional file attachment"] attachment: Option<serenity::all::Attachment>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    if name.len() > 100 {
+        return Err(user_error("Tag name is too long (max 100 characters)."));
+    }
+
+    if name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    if db::get_tag(pool, &server_id, &name).await.is_some() {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            name
+        )));
+    }
+
+    let mut asset_filename = None;
+    let tag_id = Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    if let Some(att) = &attachment {
+        let ext = att.filename.split('.').next_back().unwrap_or("png");
+        let filename = format!("{}.{}", tag_id, ext);
+        let target_path = std::path::Path::new("data")
+            .join("tag_assets")
+            .join(&filename);
+
+        if let Ok(bytes) = att.download().await {
+            tokio::fs::create_dir_all("data/tag_assets").await.ok();
+            if tokio::fs::write(&target_path, &bytes).await.is_ok() {
+                asset_filename = Some(filename);
+            }
+        }
+    }
+
+    let raw_content = content.unwrap_or_default();
+    let (content_val, cdn_asset) = if asset_filename.is_none() {
+        extract_and_download_discord_cdn_asset(&raw_content, &tag_id).await
+    } else {
+        (raw_content, None)
+    };
+    if let Some(a) = cdn_asset {
+        asset_filename = Some(a);
+    }
+
+    if content_val.is_empty() && asset_filename.is_none() {
+        return Err(user_error("Tag must have content or an attachment."));
+    }
+
+    let new_tag = db::Tag {
+        id: tag_id,
+        server_id,
+        name: name.clone(),
+        name_normalized: name.trim().to_lowercase(),
+        content: content_val,
+        asset_filename,
+        author_id: ctx.author().id.to_string(),
+        author_name: ctx.author().name.clone(),
+        created_at: Utc::now().timestamp_millis(),
+        last_used_at: None,
+        uses: 0,
+    };
+
+    db::create_tag(pool, &new_tag).await?;
+    ctx.say(format!("Tag '{}' created!", name)).await?;
+    Ok(())
+}
+
+/// Edit an existing tag
+#[poise::command(slash_command, rename = "edit")]
+pub async fn tag_edit_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name to edit"]
+    name: String,
+    #[description = "New text content"] content: Option<String>,
+    #[description = "New file attachment"] attachment: Option<serenity::all::Attachment>,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    if name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    let Some(tag) = db::get_tag(pool, &server_id, &name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", name)));
+    };
+
+    let is_admin = is_server_admin(ctx).await;
+    let is_author = tag.author_id == ctx.author().id.to_string();
+    if !is_admin && !is_author {
+        return Err(user_error("You do not have permission to edit this tag (only the author or a server admin can edit it)."));
+    }
+
+    let mut new_asset_filename = tag.asset_filename.clone();
+    let mut uploaded_file = false;
+    if let Some(att) = &attachment {
+        let ext = att.filename.split('.').next_back().unwrap_or("png");
+        let filename = format!("{}_{}.{}", tag.id, Utc::now().timestamp_millis(), ext);
+        let target_path = std::path::Path::new("data")
+            .join("tag_assets")
+            .join(&filename);
+
+        if let Ok(bytes) = att.download().await {
+            tokio::fs::create_dir_all("data/tag_assets").await.ok();
+            if tokio::fs::write(&target_path, &bytes).await.is_ok() {
+                new_asset_filename = Some(filename);
+                uploaded_file = true;
+            }
+        }
+    }
+
+    let raw_content = content.unwrap_or(tag.content);
+    let (new_content, cdn_asset) = if !uploaded_file {
+        extract_and_download_discord_cdn_asset(&raw_content, &tag.id).await
+    } else {
+        (raw_content, None)
+    };
+    if let Some(a) = cdn_asset {
+        new_asset_filename = Some(a);
+    }
+
+    if new_content.is_empty() && new_asset_filename.is_none() {
+        return Err(user_error("Tag must have content or an attachment."));
+    }
+
+    db::update_tag(pool, &tag.id, &new_content, new_asset_filename.as_deref()).await?;
+    ctx.say(format!("Tag '{}' updated!", tag.name)).await?;
+    Ok(())
+}
+
+/// Rename an existing tag
+#[poise::command(slash_command, rename = "rename")]
+pub async fn tag_rename_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Current tag name"]
+    old_name: String,
+    #[description = "New tag name"] new_name: String,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    if new_name.len() > 100 {
+        return Err(user_error("Tag name is too long (max 100 characters)."));
+    }
+
+    if new_name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    let Some(tag) = db::get_tag(pool, &server_id, &old_name).await else {
+        return Err(user_error(format!("Tag '{}' not found.", old_name)));
+    };
+
+    let is_admin = is_server_admin(ctx).await;
+    let is_author = tag.author_id == ctx.author().id.to_string();
+    if !is_admin && !is_author {
+        return Err(user_error("You do not have permission to rename this tag (only the author or a server admin can rename it)."));
+    }
+
+    if old_name.trim().to_lowercase() != new_name.trim().to_lowercase()
+        && db::get_tag(pool, &server_id, &new_name).await.is_some()
+    {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            new_name
+        )));
+    }
+
+    db::rename_tag(pool, &tag.id, &new_name).await?;
+    ctx.say(format!("Tag '{}' renamed to '{}'.", tag.name, new_name))
+        .await?;
+    Ok(())
+}
+
+/// Create a tag alias
+#[poise::command(slash_command, rename = "alias")]
+pub async fn tag_alias_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Existing tag name"]
+    target: String,
+    #[description = "New alias name"] alias_name: String,
+) -> Result<(), Error> {
+    let pool = &ctx.data().db_pool;
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+
+    if alias_name.len() > 100 {
+        return Err(user_error(
+            "Alias tag name is too long (max 100 characters).",
+        ));
+    }
+
+    if alias_name.chars().any(char::is_whitespace) {
+        return Err(user_error(
+            "Tag names must be a single word without spaces.",
+        ));
+    }
+
+    let Some(existing_tag) = db::get_tag(pool, &server_id, &target).await else {
+        return Err(user_error(format!("Tag '{}' not found.", target)));
+    };
+
+    if db::get_tag(pool, &server_id, &alias_name).await.is_some() {
+        return Err(user_error(format!(
+            "A tag named '{}' already exists.",
+            alias_name
+        )));
+    }
+
+    let tag_id = Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    let alias_tag = db::Tag {
+        id: tag_id,
+        server_id,
+        name: alias_name.clone(),
+        name_normalized: alias_name.trim().to_lowercase(),
+        content: existing_tag.content.clone(),
+        asset_filename: existing_tag.asset_filename.clone(),
+        author_id: ctx.author().id.to_string(),
+        author_name: ctx.author().name.clone(),
+        created_at: Utc::now().timestamp_millis(),
+        last_used_at: None,
+        uses: 0,
+    };
+
+    db::create_tag(pool, &alias_tag).await?;
+    ctx.say(format!(
+        "Created alias '{}' for tag '{}'.",
+        alias_name, existing_tag.name
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Delete an existing tag
+#[poise::command(slash_command, rename = "delete")]
+pub async fn tag_delete_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name to delete"]
+    name: String,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    handle_tag_delete(ctx, &server_id, &name).await
+}
+
+/// Show statistics and info for a tag
+#[poise::command(slash_command, rename = "info")]
+pub async fn tag_info_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name to inspect"]
+    name: String,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    handle_tag_info(ctx, &server_id, &name).await
+}
+
+/// List tags ordered by popularity
+#[poise::command(slash_command, rename = "list")]
+pub async fn tag_list_slash(
+    ctx: Context<'_>,
+    #[description = "Filter by author"] user: Option<serenity::User>,
+    #[description = "Page number (defaults to 1)"] page: Option<u32>,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    let target_user = user.map(|u| (u.id.to_string(), u.name));
+    handle_tag_list(ctx, &server_id, target_user, page.unwrap_or(1)).await
+}
+
+/// Search tags by name or content
+#[poise::command(slash_command, rename = "search")]
+pub async fn tag_search_slash(
+    ctx: Context<'_>,
+    #[description = "Search query"] query: String,
+    #[description = "Filter by author"] user: Option<serenity::User>,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    let target_user = user.map(|u| (u.id.to_string(), u.name));
+    handle_tag_search(ctx, &server_id, &query, target_user).await
+}
+
+/// Export server tags as JSON (Admin only)
+#[poise::command(
+    slash_command,
+    rename = "export",
+    default_member_permissions = "ADMINISTRATOR"
+)]
+pub async fn tag_export_slash(
+    ctx: Context<'_>,
+    #[description = "Filter by author"] user: Option<serenity::User>,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    let target_user = user.map(|u| (u.id.to_string(), u.name));
+    handle_tag_export(ctx, &server_id, target_user).await
+}
+
+/// Delete all tags on the server (Admin only)
+#[poise::command(
+    slash_command,
+    rename = "remove_all",
+    default_member_permissions = "ADMINISTRATOR"
+)]
+pub async fn tag_remove_all_slash(
+    ctx: Context<'_>,
+    #[description = "Filter by author"] user: Option<serenity::User>,
+    #[description = "Confirm deletion (must be True)"] confirm: bool,
+) -> Result<(), Error> {
+    if !confirm {
+        return Err(user_error("Please set confirm to True to delete all tags."));
+    }
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    let target_user = user.map(|u| (u.id.to_string(), u.name));
+    handle_tag_remove_all(ctx, &server_id, target_user).await
+}
+
+/// Clean up unreferenced media files from disk (Admin only)
+#[poise::command(
+    slash_command,
+    rename = "cleanup",
+    default_member_permissions = "ADMINISTRATOR"
+)]
+pub async fn tag_cleanup_slash(ctx: Context<'_>) -> Result<(), Error> {
+    handle_tag_cleanup(ctx).await
 }
