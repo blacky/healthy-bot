@@ -1942,7 +1942,12 @@ async fn extract_and_download_discord_cdn_asset(
     (content.to_string(), None)
 }
 
-async fn send_tag(ctx: Context<'_>, tag: &db::Tag, args: &[String]) -> Result<(), Error> {
+async fn send_tag(
+    ctx: Context<'_>,
+    tag: &db::Tag,
+    args: &[String],
+    is_random: bool,
+) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
     let _ = db::increment_tag_uses(pool, &tag.id, Utc::now().timestamp_millis()).await;
 
@@ -1970,17 +1975,27 @@ async fn send_tag(ctx: Context<'_>, tag: &db::Tag, args: &[String]) -> Result<()
         None
     };
 
-    if evaluated.text.len() <= 2000 {
+    let text = if is_random {
+        if evaluated.text.is_empty() {
+            format!("Showing tag: {}", tag.name)
+        } else {
+            format!("Showing tag: {}\n\n{}", tag.name, evaluated.text)
+        }
+    } else {
+        evaluated.text
+    };
+
+    if text.len() <= 2000 {
         let mut reply = poise::CreateReply::default();
-        if !evaluated.text.is_empty() {
-            reply = reply.content(&evaluated.text);
+        if !text.is_empty() {
+            reply = reply.content(&text);
         }
         if let Some(att) = attachment {
             reply = reply.attachment(att);
         }
         ctx.send(reply).await?;
     } else {
-        let chunks = split_message(&evaluated.text, 2000);
+        let chunks = split_message(&text, 2000);
         let mut first = true;
         for chunk in chunks {
             let mut reply = poise::CreateReply::default().content(chunk);
@@ -2719,7 +2734,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
     match first.to_lowercase().as_str() {
         "random" | "rand" => {
             if let Some(tag) = db::get_random_tag(pool, &server_id).await {
-                send_tag(ctx, &tag, &rest_vec).await
+                send_tag(ctx, &tag, &rest_vec, true).await
             } else {
                 Err(user_error("No tags found on this server."))
             }
@@ -2755,9 +2770,9 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
         "export" => handle_tag_export_prefix(ctx, &server_id, &rest_vec).await,
         _ => {
             if let Some(tag) = db::get_tag(pool, &server_id, first).await {
-                send_tag(ctx, &tag, &rest_vec).await
+                send_tag(ctx, &tag, &rest_vec, false).await
             } else if let Some(tag) = db::get_tag(pool, &server_id, trimmed).await {
-                send_tag(ctx, &tag, &[]).await
+                send_tag(ctx, &tag, &[], false).await
             } else {
                 Err(user_error(format!(
                     "Tag '{}' not found.",
@@ -2819,7 +2834,7 @@ pub async fn tag_get_slash(
         .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
         .unwrap_or_default();
 
-    send_tag(ctx, &tag, &args_vec).await
+    send_tag(ctx, &tag, &args_vec, false).await
 }
 
 /// Retrieve and send a random tag
@@ -2838,7 +2853,7 @@ pub async fn tag_random_slash(
         let args_vec: Vec<String> = args
             .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
             .unwrap_or_default();
-        send_tag(ctx, &tag, &args_vec).await
+        send_tag(ctx, &tag, &args_vec, true).await
     } else {
         Err(user_error("No tags found on this server."))
     }
