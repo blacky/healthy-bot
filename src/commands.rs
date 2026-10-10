@@ -3007,7 +3007,13 @@ async fn handle_tag_seed(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Tag command: invoke, create, delete, or inspect tags
-#[poise::command(prefix_command, rename = "t", aliases("tag"))]
+#[poise::command(
+    prefix_command,
+    track_edits,
+    track_deletion,
+    rename = "t",
+    aliases("tag")
+)]
 pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
     let server_id = ctx

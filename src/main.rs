@@ -598,6 +598,9 @@ async fn main() {
             prefix_options: poise::PrefixFrameworkOptions {
                 prefix: Some("!".into()), // Default prefix
                 ignore_bots: false,
+                edit_tracker: Some(Arc::new(poise::EditTracker::for_timespan(
+                    std::time::Duration::from_secs(60),
+                ))),
                 dynamic_prefix: Some(|ctx| {
                     Box::pin(async move {
                         let cache = ctx.data.settings_cache.read().await;
