@@ -3018,7 +3018,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
     let input_str = input.unwrap_or_default();
     let trimmed = input_str.trim();
     if trimmed.is_empty() {
-        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` (or `!t raw <name>`) | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup` | `!t seed`").await?;
+        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` (or `!t raw` / `!t owner <name>`) | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup` | `!t seed`").await?;
         return Ok(());
     }
 
@@ -3054,7 +3054,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
                 handle_tag_delete(ctx, &server_id, tag_name).await
             }
         }
-        "info" | "raw" => {
+        "info" | "raw" | "owner" => {
             let Some(tag_name) = rest_vec.first() else {
                 return Err(user_error("Please specify a tag name."));
             };
@@ -3092,6 +3092,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
         "tag_delete_slash",
         "tag_info_slash",
         "tag_raw_slash",
+        "tag_owner_slash",
         "tag_list_slash",
         "tag_search_slash",
         "tag_export_slash",
@@ -3446,6 +3447,21 @@ pub async fn tag_info_slash(
 /// View a tag's raw content and metadata
 #[poise::command(slash_command, rename = "raw")]
 pub async fn tag_raw_slash(
+    ctx: Context<'_>,
+    #[autocomplete = "autocomplete_tag_name"]
+    #[description = "Tag name to inspect"]
+    name: String,
+) -> Result<(), Error> {
+    let server_id = ctx
+        .guild_id()
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "182937695515967488".to_string());
+    handle_tag_info(ctx, &server_id, &name).await
+}
+
+/// View a tag's owner and metadata
+#[poise::command(slash_command, rename = "owner")]
+pub async fn tag_owner_slash(
     ctx: Context<'_>,
     #[autocomplete = "autocomplete_tag_name"]
     #[description = "Tag name to inspect"]
