@@ -1858,6 +1858,16 @@ async fn autocomplete_tag_name(ctx: Context<'_>, partial: &str) -> Vec<String> {
     db::search_tag_names(&ctx.data().db_pool, &server_id, partial, 25).await
 }
 
+pub fn get_tag_assets_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("TAG_ASSETS_DIR") {
+        std::path::PathBuf::from(dir)
+    } else if std::path::Path::new("/healthybot/data").exists() {
+        std::path::PathBuf::from("/healthybot/data/tag_assets")
+    } else {
+        std::path::PathBuf::from("data/tag_assets")
+    }
+}
+
 async fn download_discord_cdn_url(url: &str, tag_id: &str) -> Option<String> {
     let client = reqwest::Client::new();
     let resp = client
@@ -1891,11 +1901,9 @@ async fn download_discord_cdn_url(url: &str, tag_id: &str) -> Option<String> {
     };
 
     let filename = format!("{}.{}", tag_id, ext);
-    let target_path = std::path::Path::new("data")
-        .join("tag_assets")
-        .join(&filename);
+    let target_path = get_tag_assets_dir().join(&filename);
 
-    tokio::fs::create_dir_all("data/tag_assets").await.ok()?;
+    tokio::fs::create_dir_all(get_tag_assets_dir()).await.ok()?;
     tokio::fs::write(&target_path, &bytes).await.ok()?;
 
     Some(filename)
@@ -1946,9 +1954,7 @@ async fn send_tag(ctx: Context<'_>, tag: &db::Tag, args: &[String]) -> Result<()
     let evaluated = tags::evaluate_tag(&tag.content, &tag_ctx, tag.asset_filename.as_deref());
 
     let attachment = if let Some(filename) = &evaluated.asset_filename {
-        let asset_path = std::path::Path::new("data")
-            .join("tag_assets")
-            .join(filename);
+        let asset_path = get_tag_assets_dir().join(filename);
         if asset_path.exists() {
             match serenity::all::CreateAttachment::path(&asset_path).await {
                 Ok(att) => Some(att),
@@ -2033,12 +2039,10 @@ async fn handle_tag_create_prefix(
         if let Some(attachment) = p_ctx.msg.attachments.first() {
             let ext = attachment.filename.split('.').next_back().unwrap_or("png");
             let filename = format!("{}.{}", tag_id, ext);
-            let target_path = std::path::Path::new("data")
-                .join("tag_assets")
-                .join(&filename);
+            let target_path = get_tag_assets_dir().join(&filename);
 
             if let Ok(bytes) = attachment.download().await {
-                tokio::fs::create_dir_all("data/tag_assets").await.ok();
+                tokio::fs::create_dir_all(get_tag_assets_dir()).await.ok();
                 if tokio::fs::write(&target_path, &bytes).await.is_ok() {
                     asset_filename = Some(filename);
                 }
@@ -2107,12 +2111,10 @@ async fn handle_tag_edit_prefix(
         if let Some(attachment) = p_ctx.msg.attachments.first() {
             let ext = attachment.filename.split('.').next_back().unwrap_or("png");
             let filename = format!("{}_{}.{}", tag.id, Utc::now().timestamp_millis(), ext);
-            let target_path = std::path::Path::new("data")
-                .join("tag_assets")
-                .join(&filename);
+            let target_path = get_tag_assets_dir().join(&filename);
 
             if let Ok(bytes) = attachment.download().await {
-                tokio::fs::create_dir_all("data/tag_assets").await.ok();
+                tokio::fs::create_dir_all(get_tag_assets_dir()).await.ok();
                 if tokio::fs::write(&target_path, &bytes).await.is_ok() {
                     new_asset_filename = Some(filename);
                     uploaded_file = true;
@@ -2265,9 +2267,7 @@ async fn handle_tag_delete(ctx: Context<'_>, server_id: &str, tag_name: &str) ->
             .await
             .unwrap_or(true)
         {
-            let p = std::path::Path::new("data")
-                .join("tag_assets")
-                .join(filename);
+            let p = get_tag_assets_dir().join(filename);
             let _ = tokio::fs::remove_file(p).await;
         }
     }
@@ -2579,7 +2579,7 @@ async fn handle_tag_remove_all(
             .await
             .unwrap_or(true)
         {
-            let path = std::path::Path::new("data").join("tag_assets").join(&f);
+            let path = get_tag_assets_dir().join(&f);
             let _ = tokio::fs::remove_file(path).await;
         }
     }
@@ -2642,7 +2642,7 @@ async fn handle_tag_cleanup(ctx: Context<'_>) -> Result<(), Error> {
     let pool = &ctx.data().db_pool;
     let active_assets = db::get_all_asset_filenames(pool).await?;
 
-    let assets_dir = std::path::Path::new("data").join("tag_assets");
+    let assets_dir = get_tag_assets_dir();
     if !assets_dir.exists() {
         ctx.say("Asset directory does not exist. No files to clean up.")
             .await?;
@@ -2674,6 +2674,28 @@ async fn handle_tag_cleanup(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn handle_tag_seed(ctx: Context<'_>) -> Result<(), Error> {
+    if !is_server_admin(ctx).await {
+        return Err(user_error("Only server administrators can run seed."));
+    }
+    let pool = &ctx.data().db_pool;
+    match db::seed_tags_from_file_if_present(pool).await {
+        Ok(Some(path)) => {
+            ctx.say(format!(
+                "Successfully seeded tags from `{}` and removed the seed file.",
+                path.display()
+            ))
+            .await?;
+            Ok(())
+        }
+        Ok(None) => {
+            ctx.say("No seed file found. Place `tags_seed.sql` in `/healthybot/data/tags_seed.sql` or `data/tags_seed.sql`.").await?;
+            Ok(())
+        }
+        Err(e) => Err(user_error(format!("Failed to seed tags: {e}"))),
+    }
+}
+
 /// Tag command: invoke, create, delete, or inspect tags
 #[poise::command(prefix_command, rename = "t", aliases("tag"))]
 pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<(), Error> {
@@ -2686,7 +2708,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
     let input_str = input.unwrap_or_default();
     let trimmed = input_str.trim();
     if trimmed.is_empty() {
-        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup`").await?;
+        ctx.say("Usage: `!t <tagname> [args]` | `!t random` | `!t add <name> <content>` | `!t edit <name> <content>` | `!t rename <old> <new>` | `!t alias <tag> <alias>` | `!t delete <name>` | `!t info <name>` | `!t list [user] [page]` | `!t search <query>` | `!t export` | `!t remove all` | `!t cleanup` | `!t seed`").await?;
         return Ok(());
     }
 
@@ -2707,6 +2729,7 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
         "rename" => handle_tag_rename(ctx, &server_id, &rest_vec).await,
         "alias" => handle_tag_alias(ctx, &server_id, &rest_vec).await,
         "cleanup" => handle_tag_cleanup(ctx).await,
+        "seed" => handle_tag_seed(ctx).await,
         "delete" | "del" | "remove" | "rm" => {
             if rest_vec.first().map(|s| s.as_str()) == Some("all") {
                 handle_tag_remove_all_prefix(ctx, &server_id, &rest_vec[1..]).await
@@ -2762,7 +2785,8 @@ pub async fn t_cmd(ctx: Context<'_>, #[rest] input: Option<String>) -> Result<()
         "tag_search_slash",
         "tag_export_slash",
         "tag_remove_all_slash",
-        "tag_cleanup_slash"
+        "tag_cleanup_slash",
+        "tag_seed_slash"
     )
 )]
 pub async fn tag_slash(_: Context<'_>) -> Result<(), Error> {
@@ -2856,12 +2880,10 @@ pub async fn tag_create_slash(
     if let Some(att) = &attachment {
         let ext = att.filename.split('.').next_back().unwrap_or("png");
         let filename = format!("{}.{}", tag_id, ext);
-        let target_path = std::path::Path::new("data")
-            .join("tag_assets")
-            .join(&filename);
+        let target_path = get_tag_assets_dir().join(&filename);
 
         if let Ok(bytes) = att.download().await {
-            tokio::fs::create_dir_all("data/tag_assets").await.ok();
+            tokio::fs::create_dir_all(get_tag_assets_dir()).await.ok();
             if tokio::fs::write(&target_path, &bytes).await.is_ok() {
                 asset_filename = Some(filename);
             }
@@ -2938,12 +2960,10 @@ pub async fn tag_edit_slash(
     if let Some(att) = &attachment {
         let ext = att.filename.split('.').next_back().unwrap_or("png");
         let filename = format!("{}_{}.{}", tag.id, Utc::now().timestamp_millis(), ext);
-        let target_path = std::path::Path::new("data")
-            .join("tag_assets")
-            .join(&filename);
+        let target_path = get_tag_assets_dir().join(&filename);
 
         if let Ok(bytes) = att.download().await {
-            tokio::fs::create_dir_all("data/tag_assets").await.ok();
+            tokio::fs::create_dir_all(get_tag_assets_dir()).await.ok();
             if tokio::fs::write(&target_path, &bytes).await.is_ok() {
                 new_asset_filename = Some(filename);
                 uploaded_file = true;
@@ -3190,4 +3210,14 @@ pub async fn tag_remove_all_slash(
 )]
 pub async fn tag_cleanup_slash(ctx: Context<'_>) -> Result<(), Error> {
     handle_tag_cleanup(ctx).await
+}
+
+/// Seed tags from SQL file on the bot host/volume (Admin only)
+#[poise::command(
+    slash_command,
+    rename = "seed",
+    default_member_permissions = "ADMINISTRATOR"
+)]
+pub async fn tag_seed_slash(ctx: Context<'_>) -> Result<(), Error> {
+    handle_tag_seed(ctx).await
 }

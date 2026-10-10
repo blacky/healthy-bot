@@ -608,3 +608,40 @@ pub async fn get_all_asset_filenames(
     .await?;
     Ok(rows.into_iter().map(|(f,)| f).collect())
 }
+
+pub async fn seed_tags_from_file_if_present(
+    pool: &SqlitePool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let candidate_paths = if let Ok(custom) = std::env::var("TAG_SEED_FILE") {
+        vec![std::path::PathBuf::from(custom)]
+    } else {
+        vec![
+            std::path::PathBuf::from("/healthybot/data/tags_seed.sql"),
+            std::path::PathBuf::from("/healthybot/data/seed.sql"),
+            std::path::PathBuf::from("data/tags_seed.sql"),
+            std::path::PathBuf::from("data/seed.sql"),
+        ]
+    };
+
+    for path in candidate_paths {
+        if path.is_file() {
+            log::info!("Found tag seed SQL at {}; applying...", path.display());
+            let sql_content = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::raw_sql(&sql_content)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            log::info!(
+                "Successfully seeded tags from {}. Removing seed file...",
+                path.display()
+            );
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                log::warn!("Could not remove seed file {}: {}", path.display(), e);
+            }
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}

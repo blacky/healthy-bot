@@ -447,6 +447,12 @@ async fn main() {
         .await
         .expect("Failed to run database migrations");
 
+    match db::seed_tags_from_file_if_present(&pool).await {
+        Ok(Some(path)) => log::info!("Successfully seeded tags from file: {}", path.display()),
+        Ok(None) => {}
+        Err(e) => log::error!("Failed to seed tags from file: {}", e),
+    }
+
     // Load initial settings cache
     let settings: Vec<db::Setting> = sqlx::query_as::<_, db::Setting>("SELECT k, v FROM setting")
         .fetch_all(&pool)

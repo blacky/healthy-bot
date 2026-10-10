@@ -11,6 +11,7 @@ markovs/
 
 # Tag assets & local data
 data/
+scripts/*.sql
 
 # Environment and Secrets
 .env
