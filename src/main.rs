@@ -490,6 +490,7 @@ async fn main() {
                 .with_timezone(&chrono_tz::Europe::Amsterdam)
                 .date_naive(),
         )),
+        last_tag_channel: tokio::sync::Mutex::new(HashMap::new()),
         settings_cache: settings_cache.clone(),
     };
 

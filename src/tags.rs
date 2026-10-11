@@ -1,3 +1,4 @@
+use poise::serenity_prelude as serenity;
 use rand::Rng;
 use std::collections::HashMap;
 
@@ -129,6 +130,64 @@ fn evaluate_if_block(body: &str) -> String {
     }
 }
 
+/// State tracking for channel tag cooldowns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelCooldownState {
+    pub last_success: std::time::Instant,
+    pub warned: bool,
+}
+
+/// The decision outcome for a tag command invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagCooldownDecision {
+    Permitted,
+    RejectAndWarn { remaining_secs: u64 },
+    RejectSilently,
+}
+
+/// Check if a tag command invocation is permitted by the channel cooldown.
+///
+/// Returns:
+/// - `TagCooldownDecision::Permitted` if allowed (and updates the channel timestamp if not an edit).
+/// - `TagCooldownDecision::RejectAndWarn` the first time an invocation is blocked during this cooldown window.
+/// - `TagCooldownDecision::RejectSilently` if an invocation is blocked and the warning was already sent in this cooldown window.
+pub fn check_and_update_tag_cooldown(
+    channels: &mut HashMap<serenity::ChannelId, ChannelCooldownState>,
+    channel_id: serenity::ChannelId,
+    cooldown_secs: u64,
+    is_edit: bool,
+    now: std::time::Instant,
+) -> TagCooldownDecision {
+    if cooldown_secs == 0 || is_edit {
+        return TagCooldownDecision::Permitted;
+    }
+
+    // Prune entries older than 3600 seconds to prevent unbounded memory growth
+    channels.retain(|_, state| now.saturating_duration_since(state.last_success).as_secs() < 3600);
+
+    if let Some(state) = channels.get_mut(&channel_id) {
+        let elapsed = now.saturating_duration_since(state.last_success).as_secs();
+        if elapsed < cooldown_secs {
+            let remaining_secs = cooldown_secs.saturating_sub(elapsed).max(1);
+            if !state.warned {
+                state.warned = true;
+                return TagCooldownDecision::RejectAndWarn { remaining_secs };
+            } else {
+                return TagCooldownDecision::RejectSilently;
+            }
+        }
+    }
+
+    channels.insert(
+        channel_id,
+        ChannelCooldownState {
+            last_success: now,
+            warned: false,
+        },
+    );
+    TagCooldownDecision::Permitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +292,91 @@ mod tests {
         let eval = evaluate_tag(template, &ctx, Some("12345.png"));
         assert_eq!(eval.text, "");
         assert_eq!(eval.asset_filename, Some("12345.png".to_string()));
+    }
+
+    #[test]
+    fn test_tag_cooldown_behavior() {
+        let mut channels = HashMap::new();
+        let ch1 = serenity::ChannelId::new(100);
+        let ch2 = serenity::ChannelId::new(200);
+        let t0 = std::time::Instant::now();
+
+        // When cooldown_secs is 0, always permitted and doesn't record
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 0, false, t0),
+            TagCooldownDecision::Permitted
+        );
+        assert!(channels.is_empty());
+
+        // First call with 5s cooldown succeeds
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t0),
+            TagCooldownDecision::Permitted
+        );
+        assert!(channels.contains_key(&ch1));
+
+        // First attempt during cooldown at t0 + 2s triggers RejectAndWarn (remaining: 3s)
+        let t2 = t0 + std::time::Duration::from_secs(2);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t2),
+            TagCooldownDecision::RejectAndWarn { remaining_secs: 3 }
+        );
+
+        // Immediate subsequent attempt during the same cooldown at t0 + 3s triggers RejectSilently
+        let t3 = t0 + std::time::Duration::from_secs(3);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t3),
+            TagCooldownDecision::RejectSilently
+        );
+
+        // Third attempt during same cooldown at t0 + 4s still triggers RejectSilently
+        let t4 = t0 + std::time::Duration::from_secs(4);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t4),
+            TagCooldownDecision::RejectSilently
+        );
+
+        // Call at t0 + 3s on a different channel succeeds
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch2, 5, false, t3),
+            TagCooldownDecision::Permitted
+        );
+
+        // Message edit at t0 + 3s on ch1 succeeds without blocking
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, true, t3),
+            TagCooldownDecision::Permitted
+        );
+
+        // Call at t0 + 6s on ch1 succeeds (5s elapsed)
+        let t6 = t0 + std::time::Duration::from_secs(6);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t6),
+            TagCooldownDecision::Permitted
+        );
+
+        // Subsequent call in new cooldown window at t6 + 1s warns again
+        let t7 = t6 + std::time::Duration::from_secs(1);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t7),
+            TagCooldownDecision::RejectAndWarn { remaining_secs: 4 }
+        );
+
+        // Another immediate try in this new window is silent again
+        let t8 = t6 + std::time::Duration::from_secs(2);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch1, 5, false, t8),
+            TagCooldownDecision::RejectSilently
+        );
+
+        // Stale entries (>3600s) are pruned
+        let t4000 = t0 + std::time::Duration::from_secs(4000);
+        let ch3 = serenity::ChannelId::new(300);
+        assert_eq!(
+            check_and_update_tag_cooldown(&mut channels, ch3, 5, false, t4000),
+            TagCooldownDecision::Permitted
+        );
+        assert!(!channels.contains_key(&ch1)); // ch1 was at t6, >3600s ago relative to t4000
+        assert!(channels.contains_key(&ch3));
     }
 }

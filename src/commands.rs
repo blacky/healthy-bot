@@ -604,6 +604,7 @@ pub async fn settings(
             | "ai_cooldown_seconds"
             | "tldr_cooldown_seconds"
             | "random_chime_cooldown_seconds"
+            | "tag_cooldown_seconds"
             | "memory_extraction_interval_seconds" => {
                 let _ = value.parse::<u64>().map_err(|_| {
                     user_error(format!(
@@ -725,6 +726,7 @@ pub async fn settings(
             ("markov_cooldown_seconds", "60"),
             ("ai_cooldown_seconds", "60"),
             ("tldr_cooldown_seconds", "60"),
+            ("tag_cooldown_seconds", "5"),
             ("ai_initial_prompt", HARDENED_SYSTEM_PROMPT),
             ("ai_chat_model", "gpt-4o"),
             ("bot_status_type", "playing"),
@@ -1664,6 +1666,7 @@ async fn autocomplete_settings_key(_ctx: Context<'_>, partial: &str) -> Vec<Stri
         "markov_cooldown_seconds",
         "ai_cooldown_seconds",
         "tldr_cooldown_seconds",
+        "tag_cooldown_seconds",
         "ai_initial_prompt",
         "ai_chat_model",
         "bot_status_type",
@@ -1948,6 +1951,68 @@ async fn send_tag(
     args: &[String],
     is_random: bool,
 ) -> Result<(), Error> {
+    let cooldown_secs: u64 = {
+        let cache = ctx.data().settings_cache.read().await;
+        cache
+            .get("tag_cooldown_seconds")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+    };
+
+    let is_edit = match ctx {
+        poise::Context::Prefix(p) => p.trigger == poise::MessageDispatchTrigger::MessageEdit,
+        poise::Context::Application(_) => false,
+    };
+
+    let channel_id = ctx.channel_id();
+    let decision = {
+        let mut channels = ctx.data().last_tag_channel.lock().await;
+        tags::check_and_update_tag_cooldown(
+            &mut channels,
+            channel_id,
+            cooldown_secs,
+            is_edit,
+            std::time::Instant::now(),
+        )
+    };
+
+    match decision {
+        tags::TagCooldownDecision::Permitted => {}
+        tags::TagCooldownDecision::RejectAndWarn { remaining_secs } => {
+            match ctx {
+                poise::Context::Prefix(p) => {
+                    let _ = p
+                        .msg
+                        .react(
+                            ctx.http(),
+                            serenity::all::ReactionType::Unicode("⏳".to_string()),
+                        )
+                        .await;
+                    let _ = ctx
+                        .say(format!(
+                            "⏳ Tag command is on cooldown. Please wait {remaining_secs}s."
+                        ))
+                        .await;
+                }
+                poise::Context::Application(_) => {
+                    let _ = ctx
+                        .send(
+                            poise::CreateReply::default()
+                                .content(format!(
+                                    "⏳ Tag command is on cooldown in this channel. Please wait {remaining_secs}s."
+                                ))
+                                .ephemeral(true),
+                        )
+                        .await;
+                }
+            }
+            return Ok(());
+        }
+        tags::TagCooldownDecision::RejectSilently => {
+            return Ok(());
+        }
+    }
+
     let pool = &ctx.data().db_pool;
     let _ = db::increment_tag_uses(pool, &tag.id, Utc::now().timestamp_millis()).await;
 
