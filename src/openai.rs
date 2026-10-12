@@ -229,3 +229,136 @@ async fn parse_response<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse OpenAI response ({}): {}", e, body.trim()).into())
 }
+
+/// Build chat message request content with vision support, downloading attachments
+/// and base64-encoding images when vision is enabled.
+pub async fn build_message_content(
+    client: &reqwest::Client,
+    text: &str,
+    attachments: &[poise::serenity_prelude::Attachment],
+    supports_vision: bool,
+) -> ChatMessageRequestContent {
+    if !supports_vision {
+        return ChatMessageRequestContent::Text(text.to_string());
+    }
+
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(ContentPart::Text {
+            text: text.to_string(),
+        });
+    }
+
+    let mut image_count = 0;
+
+    // 1. Process attachments
+    for attachment in attachments {
+        if image_count >= 2 {
+            break;
+        }
+
+        let is_image = attachment
+            .content_type
+            .as_deref()
+            .map(|ct| ct.starts_with("image/"))
+            .unwrap_or_else(|| {
+                let name = attachment.filename.to_lowercase();
+                name.ends_with(".png")
+                    || name.ends_with(".jpg")
+                    || name.ends_with(".jpeg")
+                    || name.ends_with(".webp")
+                    || name.ends_with(".gif")
+            });
+
+        if is_image {
+            match attachment.download().await {
+                Ok(bytes) => {
+                    use base64::{engine::general_purpose, Engine as _};
+                    let base64_data = general_purpose::STANDARD.encode(&bytes);
+                    let mime_type = attachment.content_type.as_deref().unwrap_or("image/jpeg");
+                    let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+                    parts.push(ContentPart::ImageUrl {
+                        image_url: ImageUrlTarget {
+                            url: data_url,
+                            detail: Some("low".to_string()),
+                        },
+                    });
+                    image_count += 1;
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to download attachment {}: {:?}",
+                        attachment.filename,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Process image URLs from text
+    if image_count < 2 {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let regex = RE.get_or_init(|| {
+            regex::Regex::new(r"(?i)https?://\S+?\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?").unwrap()
+        });
+
+        for mat in regex.find_iter(text) {
+            if image_count >= 2 {
+                break;
+            }
+
+            let url = mat.as_str();
+            match client.get(url).send().await {
+                Ok(resp) => {
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|val| val.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    let is_image = content_type
+                        .as_deref()
+                        .map(|ct| ct.starts_with("image/"))
+                        .unwrap_or(false);
+
+                    if is_image {
+                        match resp.bytes().await {
+                            Ok(bytes) => {
+                                use base64::{engine::general_purpose, Engine as _};
+                                let base64_data = general_purpose::STANDARD.encode(&bytes);
+                                let mime_type =
+                                    content_type.unwrap_or_else(|| "image/jpeg".to_string());
+                                let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+                                parts.push(ContentPart::ImageUrl {
+                                    image_url: ImageUrlTarget {
+                                        url: data_url,
+                                        detail: Some("low".to_string()),
+                                    },
+                                });
+                                image_count += 1;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to read bytes from image URL {}: {:?}", url, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch image URL {}: {:?}", url, e);
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        ChatMessageRequestContent::Text(text.to_string())
+    } else if parts.len() == 1 {
+        match parts.remove(0) {
+            ContentPart::Text { text } => ChatMessageRequestContent::Text(text),
+            other => ChatMessageRequestContent::Parts(vec![other]),
+        }
+    } else {
+        ChatMessageRequestContent::Parts(parts)
+    }
+}

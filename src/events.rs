@@ -1,0 +1,617 @@
+use crate::chime;
+use crate::commands;
+use crate::db;
+use crate::memory;
+use crate::openai::{build_message_content, sanitize_name, ChatMessage, ChatMessageRequestContent};
+use crate::recent;
+use crate::{split_message, truncate_str, Data, Error};
+use poise::serenity_prelude as serenity;
+
+/// System prompt for the relevance pre-check — a cheap yes/no gate that runs
+/// after the probability roll but before generating a full interjection.
+pub const RELEVANCE_SYSTEM_PROMPT: &str =
+    "You decide whether a chat bot should spontaneously chime into an ongoing \
+     conversation. Given the recent messages, answer with only 'YES' if a short \
+     interjection would be welcome and add value, or 'NO' otherwise. Prefer NO \
+     when the conversation is private, sensitive, heated, or would not benefit \
+     from a bot interjecting.";
+
+/// Handle incoming Discord events for message tracking, Markov training, and AI interactions.
+pub async fn event_handler(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    _framework: poise::FrameworkContext<'_, Data, Error>,
+    data: &Data,
+) -> Result<(), Error> {
+    if let serenity::FullEvent::Message { new_message } = event {
+        let is_allowed_bot = if new_message.author.bot {
+            let cache = data.settings_cache.read().await;
+            cache
+                .get("allowed_bot_id")
+                .map(|id| id == &new_message.author.id.to_string())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if new_message.author.bot && !is_allowed_bot {
+            return Ok(());
+        }
+
+        let author_id_str = new_message.author.id.to_string();
+        let bot_id_str = ctx.cache.current_user().id.to_string();
+
+        // Update last message time
+        let _ = db::create_user_if_not_exists(&data.db_pool, &author_id_str).await;
+        let _ = db::update_last_message(&data.db_pool, &author_id_str, chrono::Utc::now()).await;
+
+        // Store Markov
+        data.markov_repo
+            .store(&author_id_str, &bot_id_str, &new_message.content)
+            .await;
+
+        if new_message.author.bot {
+            return Ok(());
+        }
+
+        // OpenAI Reply Logic (AiListener.kt)
+        let self_id = ctx.cache.current_user().id;
+        let mentioned = new_message.mentions.iter().any(|u| u.id == self_id);
+        let replied = new_message
+            .referenced_message
+            .as_ref()
+            .map(|m| m.author.id == self_id)
+            .unwrap_or(false);
+
+        if mentioned || replied {
+            if db::is_user_restricted(&data.db_pool, &author_id_str).await {
+                let _ = new_message
+                    .reply(ctx, "❌ You have been restricted from using the AI.")
+                    .await;
+                return Ok(());
+            }
+
+            let cooldown_secs: u64 = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_cooldown_seconds")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+
+            let mut last_inv = data.last_openai.lock().await;
+            if last_inv.elapsed().as_secs() < cooldown_secs {
+                return Ok(());
+            }
+            *last_inv = std::time::Instant::now();
+            drop(last_inv);
+
+            log::info!(
+                "OpenAI trigger from {} in channel {}: {}",
+                new_message.author.name,
+                new_message.channel_id,
+                new_message.content.trim()
+            );
+
+            let (bot_context, chat_model) = {
+                let cache = data.settings_cache.read().await;
+                (
+                    cache
+                        .get("ai_initial_prompt")
+                        .cloned()
+                        .unwrap_or_else(|| commands::HARDENED_SYSTEM_PROMPT.to_string()),
+                    cache
+                        .get("ai_chat_model")
+                        .cloned()
+                        .unwrap_or_else(|| "gpt-4o".to_string()),
+                )
+            };
+
+            // Prepend what the bot remembers about the participants, if anything.
+            let bot_context = match build_memory_prefix(data, new_message).await {
+                Some(mem) => format!("{}\n\n{}", bot_context, mem),
+                None => bot_context,
+            };
+
+            let bot_name = ctx.cache.current_user().name.clone();
+            let bot_id = ctx.cache.current_user().id;
+
+            let supports_vision = {
+                let model_lower = chat_model.to_lowercase();
+                model_lower.contains("gpt-4o")
+                    || model_lower.contains("gpt-5")
+                    || model_lower.contains("o1")
+                    || model_lower.contains("o3")
+            };
+
+            // Build conversation context by walking up the reply chain. Discord
+            // only includes the immediate parent inline (`referenced_message`);
+            // deeper ancestors come back with an empty `referenced_message`, so
+            // each one must be fetched explicitly via its `message_reference`
+            // pointer. Capped at 10 hops for token/rate-limit safety.
+            let mut messages = Vec::new();
+            let mut parent = new_message.referenced_message.as_deref().cloned();
+            for hop in 0..10 {
+                let Some(msg) = parent else {
+                    break;
+                };
+
+                let content_trimmed = msg.content.trim();
+                if content_trimmed.is_empty() && msg.attachments.is_empty() {
+                    // Fetch parent to keep traversing, but don't add empty message to vector
+                    parent = match &msg.message_reference {
+                        Some(reference) => match reference.message_id {
+                            Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    continue;
+                }
+
+                let role = if msg.author.id == bot_id {
+                    "assistant"
+                } else {
+                    "user"
+                };
+
+                // Strip images from older ancestors (hop >= 1) to save tokens and costs; only keep for the immediate parent (hop == 0)
+                let include_images = supports_vision && hop == 0;
+                let content_payload = build_message_content(
+                    &data.openai_client.client,
+                    content_trimmed,
+                    &msg.attachments,
+                    include_images,
+                )
+                .await;
+
+                messages.push(ChatMessage {
+                    role: role.to_string(),
+                    name: Some(sanitize_name(&msg.author.name)),
+                    content: content_payload,
+                });
+
+                // Fetch this message's own parent (the gateway didn't include it).
+                parent = match &msg.message_reference {
+                    Some(reference) => match reference.message_id {
+                        Some(mid) => reference.channel_id.message(ctx, mid).await.ok(),
+                        None => None,
+                    },
+                    None => None,
+                };
+            }
+            messages.reverse(); // Reverse the history to be in chronological order
+
+            // Add the system prompt at the very beginning
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    name: Some(sanitize_name(&bot_name)),
+                    content: ChatMessageRequestContent::Text(bot_context),
+                },
+            );
+
+            let prompt = new_message.content.trim();
+            if prompt.is_empty() && new_message.attachments.is_empty() {
+                return Ok(());
+            }
+
+            let prompt_payload = build_message_content(
+                &data.openai_client.client,
+                prompt,
+                &new_message.attachments,
+                supports_vision,
+            )
+            .await;
+
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                name: Some(sanitize_name(&new_message.author.name)),
+                content: prompt_payload,
+            });
+
+            let ai_debug = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_debug")
+                    .map(|v| v.trim().to_lowercase() == "true")
+                    .unwrap_or(false)
+            };
+
+            if ai_debug {
+                log::info!("=== OpenAI Message Chain ===");
+                for (i, msg) in messages.iter().enumerate() {
+                    log::info!(
+                        "  [{}] Role: {} | Name: {} | Content: {}",
+                        i,
+                        msg.role,
+                        msg.name.as_deref().unwrap_or("-"),
+                        msg.content
+                    );
+                }
+                log::info!("============================");
+            }
+
+            let thinking_reaction = serenity::all::ReactionType::Unicode("💭".to_string());
+            let _ = new_message.react(ctx, thinking_reaction.clone()).await;
+            let _typing = new_message.channel_id.start_typing(&ctx.http);
+
+            let max_tokens: u32 = {
+                let cache = data.settings_cache.read().await;
+                cache
+                    .get("ai_max_tokens")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300)
+            };
+
+            let mut attempt_messages = messages.clone();
+            let mut final_response = data
+                .openai_client
+                .create_chat_with_max_tokens(
+                    &chat_model,
+                    attempt_messages.clone(),
+                    Some(max_tokens),
+                )
+                .await;
+
+            // If the response ran out of tokens before generating output (or generated empty output),
+            // attempt 1 retry with an explicit brevity directive.
+            if let Ok(ref resp) = final_response {
+                if let Some(choice) = resp.choices.first() {
+                    if choice.message.content_text().is_empty()
+                        && choice.finish_reason.as_deref() == Some("length")
+                    {
+                        log::info!(
+                            "OpenAI hit token limit ({} tokens) for {}, attempting auto-retry with brevity directive...",
+                            max_tokens,
+                            new_message.author.name
+                        );
+                        attempt_messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            name: None,
+                            content: ChatMessageRequestContent::Text(
+                                "CRITICAL INSTRUCTION: Your previous attempt ran out of tokens. Give a concise response in 1-2 short paragraphs max to stay strictly under the token limit.".to_string(),
+                            ),
+                        });
+                        if let Ok(retry_resp) = data
+                            .openai_client
+                            .create_chat_with_max_tokens(
+                                &chat_model,
+                                attempt_messages,
+                                Some(max_tokens),
+                            )
+                            .await
+                        {
+                            final_response = Ok(retry_resp);
+                        }
+                    }
+                }
+            }
+
+            match final_response {
+                Ok(response) => {
+                    if let Some(usage) = &response.usage {
+                        let _ = db::record_chat_tokens(
+                            &data.db_pool,
+                            &author_id_str,
+                            usage.total_tokens,
+                        )
+                        .await;
+                    }
+                    if let Some(choice) = response.choices.first() {
+                        let content = choice.message.content_text();
+                        if content.is_empty() {
+                            if let Some(refusal) = &choice.message.refusal {
+                                log::warn!(
+                                    "OpenAI refusal for {}: {}",
+                                    new_message.author.name,
+                                    refusal
+                                );
+                                let _ = new_message
+                                    .reply(ctx, format!("OpenAI declined to respond: {}", refusal))
+                                    .await;
+                            } else if choice.finish_reason.as_deref() == Some("length") {
+                                log::warn!(
+                                    "OpenAI response reached max token limit (max_tokens: {}) for {}",
+                                    max_tokens,
+                                    new_message.author.name
+                                );
+                                let _ = new_message
+                                    .reply(
+                                        ctx,
+                                        format!(
+                                            "OpenAI response reached the token limit ({} tokens) before completing.",
+                                            max_tokens
+                                        ),
+                                    )
+                                    .await;
+                            } else {
+                                log::warn!(
+                                    "OpenAI returned empty response for {} (finish_reason: {:?})",
+                                    new_message.author.name,
+                                    choice.finish_reason
+                                );
+                                let _ = new_message.reply(ctx, "OpenAI did not respond.").await;
+                            }
+                        } else {
+                            if choice.finish_reason.as_deref() == Some("length") {
+                                log::warn!(
+                                    "OpenAI response was truncated at token limit (max_tokens: {}) for {}",
+                                    max_tokens,
+                                    new_message.author.name
+                                );
+                            }
+                            if content.len() <= 2000 {
+                                // Discord 2000 char limit handling
+                                let _ = new_message.reply(ctx, content).await;
+                                log::info!("OpenAI replied to {}", new_message.author.name);
+                            } else {
+                                log::info!(
+                                    "OpenAI response too long ({} chars), splitting...",
+                                    content.len()
+                                );
+                                let mut last_sent: Option<serenity::Message> = None;
+                                for chunk in split_message(content, 2000) {
+                                    let sent = if let Some(ref prev) = last_sent {
+                                        prev.reply(ctx, chunk).await.ok()
+                                    } else {
+                                        new_message.reply(ctx, chunk).await.ok()
+                                    };
+                                    last_sent = sent;
+                                }
+                                log::info!("OpenAI replied to {}", new_message.author.name);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("OpenAI API error: {:?}", e);
+                    let _ = new_message
+                        .reply(ctx, "An error occurred while communicating with OpenAI")
+                        .await;
+                }
+            }
+
+            // Remove the "thinking" reaction now that we're done (success or error),
+            // so the bot never leaves a 💭 hanging on the message.
+            let _ = new_message
+                .delete_reaction(&ctx.http, None, thinking_reaction)
+                .await;
+        }
+
+        // Not addressed directly — consider a spontaneous random chime.
+        if !mentioned && !replied {
+            try_random_chime(ctx, data, new_message).await;
+        }
+    }
+    Ok(())
+}
+
+/// Gather stored facts for the message author and any users they mention, and
+/// format them as a memory block to prepend to a system prompt. Returns `None`
+/// when memory is disabled, everyone involved is opted out, or nothing is known.
+pub async fn build_memory_prefix(data: &Data, new_message: &serenity::Message) -> Option<String> {
+    let enabled = {
+        let cache = data.settings_cache.read().await;
+        cache
+            .get("memory_enabled")
+            .map(|v| v.trim().to_lowercase() != "false")
+            .unwrap_or(true) // on by default
+    };
+    if !enabled {
+        return None;
+    }
+
+    let mut people: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for user in std::iter::once(&new_message.author).chain(new_message.mentions.iter()) {
+        if !seen.insert(user.id.get()) {
+            continue;
+        }
+        let id = user.id.to_string();
+        if db::is_opted_out(&data.db_pool, &id).await {
+            continue;
+        }
+        let facts: Vec<String> = db::get_facts(&data.db_pool, &id)
+            .await
+            .into_iter()
+            .map(|f| f.fact)
+            .collect();
+        if !facts.is_empty() {
+            people.push((user.name.clone(), facts));
+        }
+    }
+
+    memory::format_memory_context(&people)
+}
+
+/// Occasionally join a conversation on the bot's own initiative.
+///
+/// Called for human messages in which the bot was *not* mentioned or replied to.
+/// The pure gate chain ([`chime::evaluate`]) decides whether to act based on the
+/// enable flag, eligibility, a daily cap, a cooldown, and a probability roll.
+/// When it fires, an optional relevance pre-check asks a cheap model whether an
+/// interjection is actually warranted (failing closed) before the recent
+/// conversation is fed to OpenAI and a standalone message is posted. All
+/// failures are logged and swallowed — a chime is best-effort.
+pub async fn try_random_chime(
+    ctx: &serenity::Context,
+    data: &Data,
+    new_message: &serenity::Message,
+) {
+    let (settings, main_channel, prefix, base_prompt, chat_model, relevance_check) = {
+        let cache = data.settings_cache.read().await;
+        let settings = chime::ChimeSettings {
+            chance: cache
+                .get("random_chime_chance")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0),
+            cooldown_secs: cache
+                .get("random_chime_cooldown_seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600),
+            daily_cap: cache
+                .get("random_chime_daily_cap")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
+        };
+        // A dedicated chime persona/model falls back to the shared AI settings.
+        let base_prompt = cache
+            .get("random_chime_prompt")
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| cache.get("ai_initial_prompt"))
+            .cloned()
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        let chat_model = cache
+            .get("random_chime_model")
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| cache.get("ai_chat_model"))
+            .cloned()
+            .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+        let relevance_check = cache
+            .get("random_chime_relevance_check")
+            .map(|v| v.trim().to_lowercase() != "false")
+            .unwrap_or(true);
+        (
+            settings,
+            cache.get("main_text_channel").cloned(),
+            cache
+                .get("command_prefix")
+                .cloned()
+                .unwrap_or_else(|| "!".to_string()),
+            base_prompt,
+            chat_model,
+            relevance_check,
+        )
+    };
+
+    let in_main_channel =
+        main_channel.as_deref() == Some(new_message.channel_id.to_string().as_str());
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Amsterdam)
+        .date_naive();
+
+    // Evaluate the gate chain under the state locks. A fire consumes the cooldown
+    // and records the daily-cap tally *now* — before the relevance check and the
+    // reply — so both extra API calls stay bounded to ~one per cooldown window,
+    // even when relevance often declines. `mentioned`/`replied` are already false
+    // here (checked by the caller).
+    let fire = {
+        let mut last = data.last_random_chime.lock().await;
+        let mut tally = data.chime_tally.lock().await;
+        let inputs = chime::ChimeInputs {
+            content: &new_message.content,
+            prefix: &prefix,
+            in_main_channel,
+            mentioned: false,
+            replied: false,
+            elapsed_since_last: last.elapsed(),
+            chimes_today: tally.count_for(today),
+            roll: rand::random::<f64>(),
+        };
+        match chime::evaluate(&settings, &inputs) {
+            chime::ChimeDecision::Fire => {
+                *last = std::time::Instant::now();
+                tally.record(today);
+                true
+            }
+            chime::ChimeDecision::Skip(_) => false,
+        }
+    };
+    if !fire {
+        return;
+    }
+
+    let recent_messages = match new_message
+        .channel_id
+        .messages(&ctx.http, serenity::builder::GetMessages::new().limit(10))
+        .await
+    {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            log::error!("Random chime: failed to fetch recent messages: {:?}", e);
+            return;
+        }
+    };
+
+    let bot_id = ctx.cache.current_user().id;
+    let entries: Vec<recent::RecentMessage> = recent_messages
+        .iter()
+        .map(|m| recent::RecentMessage {
+            author_name: m.author.name.clone(),
+            content: m.content_safe(&ctx.cache),
+            is_bot: m.author.id == bot_id,
+        })
+        .collect();
+
+    // Relevance pre-check: a cheap yes/no on whether an interjection is warranted.
+    // Fails closed — an error, an empty transcript, or a "no" keeps the bot quiet.
+    if relevance_check {
+        let Some(transcript) = recent::build_transcript(&entries) else {
+            return;
+        };
+        let judge = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                name: None,
+                content: ChatMessageRequestContent::Text(RELEVANCE_SYSTEM_PROMPT.to_string()),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: ChatMessageRequestContent::Text(transcript),
+            },
+        ];
+        let welcome = match data.openai_client.create_chat(&chat_model, judge).await {
+            Ok(resp) => resp
+                .choices
+                .first()
+                .map(|c| chime::is_affirmative(c.message.content_text()))
+                .unwrap_or(false),
+            Err(e) => {
+                log::error!("Random chime: relevance check failed: {:?}", e);
+                false
+            }
+        };
+        if !welcome {
+            log::info!("Random chime: relevance check declined; staying quiet.");
+            return;
+        }
+    }
+
+    let mut system_prompt = format!(
+        "{}\n\nYou are spontaneously joining an ongoing conversation in a chat channel. \
+         Keep your interjection short, casual, and relevant to what is being discussed. \
+         Do not introduce yourself or explain that you are a bot.",
+        base_prompt
+    );
+    if let Some(mem) = build_memory_prefix(data, new_message).await {
+        system_prompt = format!("{}\n\n{}", system_prompt, mem);
+    }
+    let messages = recent::build_chat_messages(&system_prompt, &entries);
+
+    log::info!(
+        "Random chime triggered in channel {}",
+        new_message.channel_id
+    );
+    let _typing = new_message.channel_id.start_typing(&ctx.http);
+
+    match data.openai_client.create_chat(&chat_model, messages).await {
+        Ok(response) => {
+            if let Some(choice) = response.choices.first() {
+                let content = choice.message.content_text().trim();
+                if !content.is_empty() {
+                    // Post as a standalone message (no reply-ping) so it reads as
+                    // casually joining in. Chimes are meant to be short; truncate
+                    // to Discord's 2000-char limit rather than splitting.
+                    let _ = new_message
+                        .channel_id
+                        .say(&ctx.http, truncate_str(content, 2000).into_owned())
+                        .await;
+                }
+            }
+        }
+        Err(e) => log::error!("Random chime OpenAI error: {:?}", e),
+    }
+}

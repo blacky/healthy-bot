@@ -1,10 +1,13 @@
 pub mod chime;
 pub mod commands;
 pub mod db;
+pub mod events;
 pub mod markov;
 pub mod memory;
 pub mod openai;
+pub mod pagination;
 pub mod recent;
+pub mod settings;
 pub mod tags;
 pub mod tasks;
 
@@ -31,6 +34,65 @@ pub struct Data {
     pub settings_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
+impl Data {
+    /// Read a string setting from the in-memory cache.
+    pub async fn get_setting(&self, key: &str) -> Option<String> {
+        let cache = self.settings_cache.read().await;
+        cache.get(key).cloned()
+    }
+
+    /// Read a string setting from the in-memory cache or return a fallback default.
+    pub async fn get_setting_or(&self, key: &str, default: &str) -> String {
+        self.get_setting(key)
+            .await
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Read a `u64` setting from the in-memory cache or return a fallback default.
+    pub async fn get_setting_u64(&self, key: &str, default: u64) -> u64 {
+        let cache = self.settings_cache.read().await;
+        cache
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Read a `u32` setting from the in-memory cache or return a fallback default.
+    pub async fn get_setting_u32(&self, key: &str, default: u32) -> u32 {
+        let cache = self.settings_cache.read().await;
+        cache
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Read an `f64` setting from the in-memory cache or return a fallback default.
+    pub async fn get_setting_f64(&self, key: &str, default: f64) -> f64 {
+        let cache = self.settings_cache.read().await;
+        cache
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Read a boolean setting from the in-memory cache or return a fallback default.
+    pub async fn get_setting_bool(&self, key: &str, default: bool) -> bool {
+        let cache = self.settings_cache.read().await;
+        cache
+            .get(key)
+            .map(|v| v.trim().to_lowercase() == "true")
+            .unwrap_or(default)
+    }
+
+    /// Update a setting in both the SQLite database and the in-memory cache.
+    pub async fn set_setting(&self, key: &str, value: &str) -> sqlx::Result<()> {
+        db::set_setting(&self.db_pool, key, value).await?;
+        let mut cache = self.settings_cache.write().await;
+        cache.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+}
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// An error whose message is intended to be shown to the end user verbatim
@@ -51,6 +113,14 @@ impl std::error::Error for UserError {}
 /// Build a user-facing [`UserError`] as a boxed [`Error`].
 pub fn user_error(msg: impl Into<String>) -> Error {
     Box::new(UserError(msg.into()))
+}
+
+/// Centralized factory for consistent bot embed styling.
+pub fn create_embed(title: &str) -> serenity::builder::CreateEmbed {
+    serenity::builder::CreateEmbed::new()
+        .title(title)
+        .color(0xFFFF00) // HealthyBot Yellow
+        .footer(serenity::builder::CreateEmbedFooter::new("Healthy Bot"))
 }
 
 /// Truncate `s` to at most `max` characters (Unicode scalar values, which is how

@@ -482,33 +482,20 @@ pub async fn search_tags(
     limit: u32,
 ) -> sqlx::Result<Vec<Tag>> {
     let pattern = format!("%{}%", query.trim().to_lowercase());
-    match author_id {
-        Some(aid) => {
-            sqlx::query_as::<_, Tag>(
-                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? AND author_id = ? AND name_normalized LIKE ? \
-                 ORDER BY uses DESC, name_normalized ASC LIMIT ?",
-            )
-            .bind(server_id)
-            .bind(aid)
-            .bind(&pattern)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        None => {
-            sqlx::query_as::<_, Tag>(
-                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? AND name_normalized LIKE ? \
-                 ORDER BY uses DESC, name_normalized ASC LIMIT ?",
-            )
-            .bind(server_id)
-            .bind(&pattern)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
+    let sql = if author_id.is_some() {
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? AND author_id = ? AND name_normalized LIKE ? \
+         ORDER BY uses DESC, name_normalized ASC LIMIT ?"
+    } else {
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? AND name_normalized LIKE ? \
+         ORDER BY uses DESC, name_normalized ASC LIMIT ?"
+    };
+    let mut q = sqlx::query_as::<_, Tag>(sql).bind(server_id);
+    if let Some(aid) = author_id {
+        q = q.bind(aid);
     }
+    q.bind(&pattern).bind(limit as i64).fetch_all(pool).await
 }
 
 pub async fn is_asset_used_elsewhere(
@@ -526,32 +513,38 @@ pub async fn is_asset_used_elsewhere(
     Ok(row.0 > 0)
 }
 
+/// Delete an asset file from disk if it is no longer referenced by any other tag in the database.
+pub async fn delete_tag_asset_if_unused(
+    pool: &SqlitePool,
+    filename: &str,
+    excluded_tag_id: &str,
+    assets_dir: &std::path::Path,
+) {
+    if !is_asset_used_elsewhere(pool, filename, excluded_tag_id)
+        .await
+        .unwrap_or(true)
+    {
+        let _ = tokio::fs::remove_file(assets_dir.join(filename)).await;
+    }
+}
+
 pub async fn export_all_tags(
     pool: &SqlitePool,
     server_id: &str,
     author_id: Option<&str>,
 ) -> sqlx::Result<Vec<Tag>> {
-    match author_id {
-        Some(aid) => {
-            sqlx::query_as::<_, Tag>(
-                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? AND author_id = ? ORDER BY name_normalized ASC",
-            )
-            .bind(server_id)
-            .bind(aid)
-            .fetch_all(pool)
-            .await
-        }
-        None => {
-            sqlx::query_as::<_, Tag>(
-                "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
-                 FROM tags WHERE server_id = ? ORDER BY name_normalized ASC",
-            )
-            .bind(server_id)
-            .fetch_all(pool)
-            .await
-        }
+    let sql = if author_id.is_some() {
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? AND author_id = ? ORDER BY name_normalized ASC"
+    } else {
+        "SELECT id, server_id, name, name_normalized, content, asset_filename, author_id, author_name, created_at, last_used_at, uses \
+         FROM tags WHERE server_id = ? ORDER BY name_normalized ASC"
+    };
+    let mut q = sqlx::query_as::<_, Tag>(sql).bind(server_id);
+    if let Some(aid) = author_id {
+        q = q.bind(aid);
     }
+    q.fetch_all(pool).await
 }
 
 pub async fn delete_all_tags(
@@ -559,39 +552,27 @@ pub async fn delete_all_tags(
     server_id: &str,
     author_id: Option<&str>,
 ) -> sqlx::Result<(u64, Vec<Option<String>>)> {
-    let asset_files: Vec<(Option<String>,)> = match author_id {
-        Some(aid) => {
-            sqlx::query_as::<_, (Option<String>,)>(
-                "SELECT asset_filename FROM tags WHERE server_id = ? AND author_id = ? AND asset_filename IS NOT NULL",
-            )
-            .bind(server_id)
-            .bind(aid)
-            .fetch_all(pool)
-            .await?
-        }
-        None => {
-            sqlx::query_as::<_, (Option<String>,)>(
-                "SELECT asset_filename FROM tags WHERE server_id = ? AND asset_filename IS NOT NULL",
-            )
-            .bind(server_id)
-            .fetch_all(pool)
-            .await?
-        }
+    let select_sql = if author_id.is_some() {
+        "SELECT asset_filename FROM tags WHERE server_id = ? AND author_id = ? AND asset_filename IS NOT NULL"
+    } else {
+        "SELECT asset_filename FROM tags WHERE server_id = ? AND asset_filename IS NOT NULL"
     };
+    let mut q_select = sqlx::query_as::<_, (Option<String>,)>(select_sql).bind(server_id);
+    if let Some(aid) = author_id {
+        q_select = q_select.bind(aid);
+    }
+    let asset_files: Vec<(Option<String>,)> = q_select.fetch_all(pool).await?;
 
-    let count = match author_id {
-        Some(aid) => sqlx::query("DELETE FROM tags WHERE server_id = ? AND author_id = ?")
-            .bind(server_id)
-            .bind(aid)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-        None => sqlx::query("DELETE FROM tags WHERE server_id = ?")
-            .bind(server_id)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+    let delete_sql = if author_id.is_some() {
+        "DELETE FROM tags WHERE server_id = ? AND author_id = ?"
+    } else {
+        "DELETE FROM tags WHERE server_id = ?"
     };
+    let mut q_del = sqlx::query(delete_sql).bind(server_id);
+    if let Some(aid) = author_id {
+        q_del = q_del.bind(aid);
+    }
+    let count = q_del.execute(pool).await?.rows_affected();
 
     Ok((count, asset_files.into_iter().map(|(f,)| f).collect()))
 }

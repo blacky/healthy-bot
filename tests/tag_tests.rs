@@ -1,22 +1,7 @@
+mod common;
+use common::setup_test_db;
 use healthy_bot::db::{self, Tag};
 use healthy_bot::tags::{evaluate_tag, TagContext};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-use std::str::FromStr;
-use tempfile::NamedTempFile;
-
-async fn setup_test_db() -> (SqlitePool, NamedTempFile) {
-    let temp_file = NamedTempFile::new().unwrap();
-    let db_path = temp_file.path().to_str().unwrap();
-
-    let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-        .unwrap()
-        .create_if_missing(true);
-
-    let pool = SqlitePool::connect_with(options).await.unwrap();
-    sqlx::migrate!().run(&pool).await.unwrap();
-
-    (pool, temp_file)
-}
 
 #[tokio::test]
 async fn test_create_and_get_tag() {
