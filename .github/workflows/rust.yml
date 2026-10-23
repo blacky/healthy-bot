@@ -117,7 +117,7 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
           echo "Disabling Bot Fight Mode..."
-          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+          curl -sS -o /dev/null -f -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
                -H "Authorization: Bearer $CF_API_TOKEN" \
                -H "Content-Type: application/json" \
                -d '{"fight_mode":false}'
@@ -125,7 +125,7 @@ jobs:
           echo "Waiting 45 seconds for Cloudflare edge propagation..."
           sleep 45
 
-# Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
+      # Send a GitHub-style signed webhook to Komodo's stack `/deploy` listener.
       # Komodo verifies the HMAC-SHA256 signature against KOMODO_WEBHOOK_SECRET,
       # matches the branch in the payload, then pulls the new image and recreates
       # the stack.
@@ -135,18 +135,24 @@ jobs:
           KOMODO_WEBHOOK_URL: ${{ secrets.KOMODO_WEBHOOK_URL }}
           KOMODO_WEBHOOK_SECRET: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
         run: |
+          # Mask hostname extracted from URL in case curl encounters DNS or network errors
+          HOST="$(printf '%s' "$KOMODO_WEBHOOK_URL" | sed -E 's|^https?://([^/:]+).*|\1|')"
+          [ -n "$HOST" ] && echo "::add-mask::$HOST"
+
           payload='{"ref":"refs/heads/main"}'
           sig="sha256=$(printf '%s' "$payload" \
             | openssl dgst -sha256 -hmac "$KOMODO_WEBHOOK_SECRET" \
             | awk '{print $2}')"
-          curl -fsS -X POST "$KOMODO_WEBHOOK_URL" \
+          echo "::add-mask::$sig"
+
+          curl -fsS -o /dev/null -X POST "$KOMODO_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
             -H 'X-GitHub-Event: push' \
             -H "X-Hub-Signature-256: $sig" \
             -H "User-Agent: GitHub-Actions-Deploy" \
             -d "$payload"
 
-# Always Re-enable Bot Fight Mode (even if the webhook fails)
+      # Always Re-enable Bot Fight Mode (even if the webhook fails)
       - name: Re-enable Bot Fight Mode
         if: always() && steps.guard.outputs.enabled == 'true'
         env:
@@ -154,7 +160,7 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
           echo "Re-enabling Bot Fight Mode..."
-          curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+          curl -sS -o /dev/null -f -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
                -H "Authorization: Bearer $CF_API_TOKEN" \
                -H "Content-Type: application/json" \
                -d '{"fight_mode":true}'
